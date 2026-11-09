@@ -1,0 +1,18 @@
+{
+  "required": true,
+  "minVersion": "0.8",
+  "package": "com.s1ind.opt.mixin",
+  "plugin": "com.s1ind.opt.mixin.S1indMixinPlugin",
+  "compatibilityLevel": "JAVA_21",
+  "mixins": [
+    "common.UtilMixin",
+    "common.LightingProviderMixin",
+    "common.MobEntityMixin"
+  ],
+  "client": [
+    "client.MinecraftClientMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}
