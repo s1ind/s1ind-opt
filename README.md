@@ -1,83 +1,77 @@
-# S1ind Optimizer
+# S1ind Optimizer v2.5.0
 
-A lightweight, targeted performance mod for **Minecraft Java 1.21.11 (Fabric)**.
+Легковесный и прозрачный мод для оптимизации **Minecraft Java 1.21.11 (Fabric Loader >=0.19.0)**.
 
-Designed for complete, zero-conflict compatibility with **Sodium**, **ImmediatelyFast**, **Iris**, and **Lithium**.
-
----
-
-## ⚡ What it actually does
-
-Unlike heavy mods that attempt to rewrite Minecraft's entire rendering pipeline, **S1ind Optimizer** targets specific high-impact bottlenecks without interfering with Sodium's Vulkan/OpenGL rendering:
-
-1. **Render Thread Priority Elevation (`MinecraftClientMixin`)**  
-   Forces the OS scheduler to treat the Minecraft Render Thread with `Thread.MAX_PRIORITY` (10). Prevents frame drops, micro-stutters, and GPU starvation caused by background operating system tasks.
-
-2. **Distant Passive Mob AI Throttling (`MobEntityMixin`)**  
-   Distant passive entities (cows, sheep, pigs, chickens, villagers) further than 32 blocks from any player skip 2 out of 3 pathfinding/sensing ticks (`tickNewAi`). Hostile mobs (Zombies, Creepers, Skeletons) and mobs in combat are **100% untouched**. Reduces CPU pathfinding overhead near animal pens and villages.
-
-3. **Lighting Update Fast-Path (`LightingProviderMixin`)**  
-   Checks `hasUpdates()` before traversing lighting providers. If no light changes are queued, returns `0` immediately without iterating through block and sky light loops.
-
-4. **Background Worker Budgeting (`UtilMixin`)**  
-   Allows user configuration of the background worker thread pool used by Minecraft for chunk generation, loading, and world meshing via `config/s1ind_opt.json`.
-
-5. **Memory Pressure Watchdog (`MemoryCleaner`)**  
-   Monitors heap utilization on a low-priority background daemon thread. Instead of spamming `System.gc()` every few seconds (which causes frame freezes), it proactively runs garbage collection only when used heap memory crosses the configured threshold (default: 85%) to prevent `OutOfMemoryError` crashes.
+Цель мода — не переписывать графический конвейер (с этим отлично справляется Sodium), а точечно устранять архитектурные узкие места CPU и планировщика задач Minecraft без конфликтов с популярным оптимизационным стеком.
 
 ---
 
-## ⚙️ Configuration (`config/s1ind_opt.json`)
+## ⚡ Что реально делает v2.5.0
 
-The config file is generated automatically on first launch:
+### 1. Приоритет главного потока рендера (`MinecraftClientMixin`)
+- **Как работает:** при инициализации клиента поток LWJGL/Render переводится в `Thread.MAX_PRIORITY` (10).
+- **Эффект:** планировщик операционной системы Windows/Linux отдаёт предпочтение потоку отрисовки кадров при распределении квантов процессорного времени (timeslice bias). Это снижает вероятность того, что сторонние системные процессы вызовут микрофриз между вызовами `glfwSwapBuffers`.
+- *Честное примечание:* это не является аппаратной привязкой (core affinity) и не даёт физического монопольного доступа к ядру CPU.
+
+### 2. Реальное понижение приоритета воркеров (`UtilMixin`)
+- **Как работает:** перехватывает фабрики потоков `ForkJoinWorkerThread` и `IO-Worker` в `net.minecraft.util.Util`, назначая им `Thread.NORM_PRIORITY - 1` (4).
+- **Эффект:** фоновые вычисления (генерация мира, сжатие сетевых пакетов, сохранение чанков на диск) больше не конкурируют на равных правах с игровым циклом и потоком рендера.
+
+### 3. Интеллектуальный расчёт пула фоновых потоков (`S1indConfig`)
+- Автоматический режим теперь рассчитывает потоки с учётом архитектуры процессора:
+  - **2 ядра (Dual-Core):** строго **1 фоновый поток** (второе ядро остаётся свободным под игру и графику).
+  - **3–4 ядра (Quad-Core):** `cores - 1` (3 фоновых потока, 1 свободное ядро).
+  - **5+ ядер (Multi-Core):** `cores - 2` (до 8 потоков, 2 ядра зарезервированы под Game Loop и Render).
+
+### 4. Троттлинг AI удалённых пассивных мобов (`MobEntityMixin`)
+- **Как работает:** для пассивных сущностей (`PassiveEntity`: коровы, овцы, свиньи, куры, деревенские жители), находящихся на расстоянии более 32 блоков от ближайшего игрока, пропускаются 2 из 3 тиков `tickNewAi`.
+- **Безопасность:** враждебные мобы (зомби, скелеты, криперы) и мобы в состоянии боя или размножения обрабатываются на 100% штатно каждый тик.
+
+### 5. Fast-Path для движка освещения (`LightingProviderMixin`)
+- При отсутствии ожидающих обновлений (`!hasUpdates()`) моментально возвращает `0`, пропуская холостые обходы провайдеров блочного и небесного света.
+
+### 6. Умный страж памяти (`MemoryCleaner`)
+- **По умолчанию выключен** для обычных машин (чтобы сборщик мусора не вызывал паузы).
+- Включается для машин с дефицитом ОЗУ (2–3 ГБ). Срабатывает **только** при одновременном выполнении двух условий: загрузка кучи >88% **и** свободного места осталось менее 250 МБ.
+
+### 7. Безупречная совместимость (`S1indMixinPlugin`)
+- Архитектурная совместимость: мод вообще не трогает вершинные буферы, шейдеры и геометрию чанков, поэтому **на 100% совместим с Sodium, Iris Shaders, ImmediatelyFast и Lithium**.
+- При обнаружении сторонних модов на свет (Starlight, Phosphor) миксин `LightingProviderMixin` автоматически отключается во избежание конфликтов.
+
+---
+
+## ⚙️ Конфигурация (`config/s1ind_opt.json`)
+
+Файл генерируется автоматически при первом запуске:
 
 ```json
 {
   "boostRenderThreadPriority": true,
+  "lowerBackgroundThreadPriority": true,
+  "backgroundThreadCount": 0,
   "throttleDistantPassiveMobAi": true,
   "fastLightUpdates": true,
-  "autoMemoryClean": true,
+  "autoMemoryClean": false,
   "memoryCheckIntervalSeconds": 30,
-  "memoryPressureThresholdPercent": 85,
-  "backgroundThreadCount": 0
+  "memoryPressureThresholdPercent": 88
 }
 ```
 
-- `boostRenderThreadPriority`: Elevates render thread priority to 10.
-- `throttleDistantPassiveMobAi`: Skips redundant AI updates for distant animals.
-- `fastLightUpdates`: Early-exit on empty lighting queue.
-- `autoMemoryClean`: Activates the background memory watchdog.
-- `memoryCheckIntervalSeconds`: Frequency of memory pressure checks in seconds.
-- `memoryPressureThresholdPercent`: Heap percentage threshold (50–95%) that triggers reclamation.
-- `backgroundThreadCount`: `0` = auto (CPU cores - 1).
+---
+
+## 📦 Сборка и установка
+
+- **Требования к среде:** Minecraft 1.21.11, Fabric Loader >=0.19.0, Java 21+.
+- **Сборка проекта:**
+  ```bash
+  git clone https://github.com/s1ind/s1ind-opt.git
+  cd s1ind-opt
+  ./gradlew build
+  ```
+- Готовые бинарники компилируются в `build/libs/`.
 
 ---
 
-## 📦 Downloads & Installation
+## 📄 Лицензия
 
-1. Install **Fabric Loader** for **Minecraft 1.21.11**.
-2. Download the pre-built jar from [`build/libs/s1ind-optimizer-2.4.0.jar`](build/libs/s1ind-optimizer-2.4.0.jar).
-3. Place `s1ind-optimizer-2.4.0.jar` into your `.minecraft/mods` folder.
-4. (Optional) Install alongside **Sodium**, **ImmediatelyFast**, and **Lithium** for maximum performance.
-
----
-
-## 🔨 Building from Source
-
-Requirements:
-- **JDK 25** (or compatible modern JDK)
-- Fabric Loom 1.18.4+
-
-```bash
-git clone https://github.com/<username>/s1ind-optimizer.git
-cd s1ind-optimizer
-./gradlew build
-```
-
-Compiled `.jar` will be in `build/libs/`.
-
----
-
-## 📄 License
-
-This project is licensed under the [MIT License](LICENSE).
+MIT License (c) 2026 s1ind

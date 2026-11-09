@@ -19,14 +19,16 @@ public class S1indOptMod implements ModInitializer {
     public void onInitialize() {
         config = S1indConfig.load();
 
-        LOG.info("[S1ind] Initializing S1ind Optimizer");
+        LOG.info("[S1ind] Initializing S1ind Optimizer v2.5.0");
         LOG.info("[S1ind] Render Thread Priority: {}", config.boostRenderThreadPriority() ? "MAX (10)" : "DEFAULT (5)");
+        LOG.info("[S1ind] Worker Thread Priority: {}", config.lowerBackgroundThreadPriority() ? "NORM-1 (4)" : "DEFAULT (5)");
+        LOG.info("[S1ind] Background Worker Thread Budget: {} threads", config.backgroundThreadCount());
         LOG.info("[S1ind] Distant Passive Mob AI Throttling: {}", config.throttleDistantPassiveMobAi() ? "ON" : "OFF");
         LOG.info("[S1ind] Light Update Early Exit: {}", config.fastLightUpdates() ? "ON" : "OFF");
-        LOG.info("[S1ind] Memory Pressure Watchdog: {}", config.autoMemoryClean() ? "ON (Threshold: " + config.memoryPressureThresholdPercent() + "%)" : "OFF");
+        LOG.info("[S1ind] Memory Pressure Watchdog: {}", config.autoMemoryClean() ? "ON (Threshold: " + config.memoryPressureThresholdPercent() + "%)" : "OFF (default)");
 
         if (FabricLoader.getInstance().getEnvironmentType() == EnvType.SERVER && config.autoMemoryClean()) {
-            MemoryCleaner.start(config.memoryCheckIntervalSeconds(), config.memoryPressureThresholdPercent());
+            MemoryCleaner.start();
         }
     }
 

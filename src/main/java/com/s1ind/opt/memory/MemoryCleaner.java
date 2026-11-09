@@ -1,84 +1,101 @@
 package com.s1ind.opt.memory;
 
 import com.s1ind.opt.S1indOptMod;
-
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
+import com.s1ind.opt.config.S1indConfig;
 
 /**
- * Intelligent memory pressure watchdog.
+ * Low-overhead memory pressure watchdog.
  *
- * Runs on a daemon thread. Instead of blindly forcing System.gc() in a tight loop,
- * it monitors heap utilization against a configured threshold (default: 85%).
- * Only when memory pressure threatens to trigger a full Stop-The-World GC freeze
- * does it request proactive background reclamation.
+ * Runs as a daemon thread at MIN_PRIORITY.
+ * By default disabled in v2.5.0, intended as a safeguard for low-RAM machines (<=3GB).
+ *
+ * Does not spam System.gc(). Only triggers a collection when heap usage exceeds
+ * the configured threshold (default 88%) and free memory is critical (<250MB).
  */
-public class MemoryCleaner {
+public final class MemoryCleaner {
 
-    private static ScheduledExecutorService scheduler;
     private static volatile boolean running = false;
+    private static Thread watchdogThread = null;
 
-    public static synchronized void start(int intervalSeconds, int thresholdPercent) {
-        if (running && scheduler != null && !scheduler.isShutdown()) {
+    private MemoryCleaner() {}
+
+    public static synchronized void start() {
+        S1indConfig config = S1indOptMod.config();
+        if (config == null || !config.autoMemoryClean()) {
+            S1indOptMod.LOG.info("[S1ind] Memory Watchdog is disabled (default for normal RAM environments).");
             return;
         }
 
-        scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread t = new Thread(r, "S1ind-Memory-Watchdog");
-            t.setDaemon(true);
-            t.setPriority(Thread.MIN_PRIORITY);
-            return t;
-        });
-
-        scheduler.scheduleAtFixedRate(
-            () -> checkAndClean(thresholdPercent),
-            intervalSeconds,
-            intervalSeconds,
-            TimeUnit.SECONDS
-        );
-
-        running = true;
-        S1indOptMod.LOG.info("[S1ind Memory] Watchdog active: checking every {}s (triggers above {}% heap)",
-            intervalSeconds, thresholdPercent);
-    }
-
-    public static void checkAndClean(int thresholdPercent) {
-        try {
-            Runtime rt = Runtime.getRuntime();
-            long maxBytes = rt.maxMemory();
-            long totalBytes = rt.totalMemory();
-            long freeBytes = rt.freeMemory();
-            long usedBytes = totalBytes - freeBytes;
-
-            double usedRatio = (double) usedBytes / maxBytes;
-            int usedPercent = (int) (usedRatio * 100);
-
-            if (usedPercent >= thresholdPercent) {
-                long beforeMb = usedBytes / (1024 * 1024);
-                S1indOptMod.LOG.warn("[S1ind Memory] High heap pressure ({}% / {} MB). Triggering proactive GC...",
-                    usedPercent, beforeMb);
-
-                System.gc();
-
-                long afterBytes = rt.totalMemory() - rt.freeMemory();
-                long afterMb = afterBytes / (1024 * 1024);
-                long freedMb = beforeMb - afterMb;
-
-                S1indOptMod.LOG.info("[S1ind Memory] Reclamation complete: {} MB -> {} MB (Freed {} MB)",
-                    beforeMb, afterMb, freedMb);
-            }
-        } catch (Throwable t) {
-            S1indOptMod.LOG.warn("[S1ind Memory] Watchdog check failed: {}", t.getMessage());
+        if (running) {
+            return;
         }
+        running = true;
+
+        watchdogThread = new Thread(MemoryCleaner::runLoop, "S1ind-Memory-Watchdog");
+        watchdogThread.setDaemon(true);
+        watchdogThread.setPriority(Thread.MIN_PRIORITY); // Priority 1: never interrupts game logic
+        watchdogThread.start();
+
+        S1indOptMod.LOG.info("[S1ind] Memory Watchdog active (interval: {}s, threshold: {}%).",
+            config.memoryCheckIntervalSeconds(),
+            config.memoryPressureThresholdPercent()
+        );
     }
 
     public static synchronized void stop() {
-        if (scheduler != null) {
-            scheduler.shutdownNow();
-            scheduler = null;
-        }
         running = false;
-        S1indOptMod.LOG.info("[S1ind Memory] Watchdog stopped");
+        if (watchdogThread != null) {
+            watchdogThread.interrupt();
+            watchdogThread = null;
+        }
+    }
+
+    private static void runLoop() {
+        while (running) {
+            try {
+                int intervalSec = S1indOptMod.config() != null
+                    ? S1indOptMod.config().memoryCheckIntervalSeconds()
+                    : 30;
+                Thread.sleep(intervalSec * 1000L);
+
+                checkAndClean();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            } catch (Throwable t) {
+                S1indOptMod.LOG.warn("[S1ind] Memory Watchdog encountered an error", t);
+            }
+        }
+    }
+
+    private static void checkAndClean() {
+        S1indConfig config = S1indOptMod.config();
+        if (config == null || !config.autoMemoryClean()) {
+            return;
+        }
+
+        Runtime runtime = Runtime.getRuntime();
+        long maxMemory = runtime.maxMemory();
+        long allocatedMemory = runtime.totalMemory();
+        long freeMemory = runtime.freeMemory();
+        long usedMemory = allocatedMemory - freeMemory;
+
+        if (maxMemory <= 0) return;
+
+        double usedPercent = ((double) usedMemory / (double) maxMemory) * 100.0;
+        long freeRemainingBytes = maxMemory - usedMemory;
+        long criticalThresholdBytes = 250L * 1024L * 1024L; // 250 MB
+
+        // Only invoke GC if heap is critically filled and remaining capacity is scarce
+        if (usedPercent >= config.memoryPressureThresholdPercent() && freeRemainingBytes < criticalThresholdBytes) {
+            long usedBeforeMb = usedMemory / (1024 * 1024);
+            System.gc();
+
+            long usedAfterMb = (runtime.totalMemory() - runtime.freeMemory()) / (1024 * 1024);
+            long reclaimedMb = Math.max(0, usedBeforeMb - usedAfterMb);
+
+            S1indOptMod.LOG.info("[S1ind] Emergency GC triggered under high pressure ({:.1f}%): reclaimed ~{} MB (used: {} MB -> {} MB)",
+                usedPercent, reclaimedMb, usedBeforeMb, usedAfterMb);
+        }
     }
 }

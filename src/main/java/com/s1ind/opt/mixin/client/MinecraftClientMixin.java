@@ -11,7 +11,7 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 /**
  * Client lifecycle optimization:
  * - Elevates Render Thread priority to Thread.MAX_PRIORITY (10) for frame dispatch.
- * - Starts memory watchdog if enabled.
+ * - Starts memory watchdog if enabled in config.
  * - Shuts down watchdog on game stop.
  */
 @Mixin(MinecraftClient.class)
@@ -27,10 +27,7 @@ public abstract class MinecraftClientMixin {
             }
 
             if (S1indOptMod.config().autoMemoryClean()) {
-                MemoryCleaner.start(
-                    S1indOptMod.config().memoryCheckIntervalSeconds(),
-                    S1indOptMod.config().memoryPressureThresholdPercent()
-                );
+                MemoryCleaner.start();
             }
         }
     }
