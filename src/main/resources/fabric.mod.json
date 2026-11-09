@@ -3,7 +3,7 @@
   "id": "s1ind_opt",
   "version": "${version}",
   "name": "S1ind Optimizer",
-  "description": "Targeted lightweight performance tweaks: Render Thread priority elevation, distant passive mob AI throttling, light check fast-paths, worker thread budgeting.",
+  "description": "Adaptive Performance Engine (APE): Real-time 1% / 0.1% Low telemetry, stress-based background throttling, safe thread budgeting, tiered mob AI shedding, zero-conflict stack compatibility.",
   "authors": [
     "s1ind"
   ],

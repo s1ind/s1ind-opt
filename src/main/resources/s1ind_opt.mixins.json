@@ -10,7 +10,8 @@
     "common.MobEntityMixin"
   ],
   "client": [
-    "client.MinecraftClientMixin"
+    "client.MinecraftClientMixin",
+    "client.DebugHudMixin"
   ],
   "injectors": {
     "defaultRequire": 1

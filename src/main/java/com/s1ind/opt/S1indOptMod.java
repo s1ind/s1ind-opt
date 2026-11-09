@@ -19,13 +19,15 @@ public class S1indOptMod implements ModInitializer {
     public void onInitialize() {
         config = S1indConfig.load();
 
-        LOG.info("[S1ind] Initializing S1ind Optimizer v2.5.0");
+        LOG.info("[S1ind] Initializing S1ind Optimizer v3.0.0 (Adaptive Performance Engine)");
+        LOG.info("[S1ind] Active Profile: {}", config.profile());
+        LOG.info("[S1ind] Adaptive Performance Engine: {}", config.enableAdaptiveEngine() ? "ACTIVE" : "DISABLED");
+        LOG.info("[S1ind] In-game F3 Telemetry (1% / 0.1% Low): {}", config.enableF3Telemetry() ? "ENABLED" : "DISABLED");
         LOG.info("[S1ind] Render Thread Priority: {}", config.boostRenderThreadPriority() ? "MAX (10)" : "DEFAULT (5)");
         LOG.info("[S1ind] Worker Thread Priority: {}", config.lowerBackgroundThreadPriority() ? "NORM-1 (4)" : "DEFAULT (5)");
-        LOG.info("[S1ind] Background Worker Thread Budget: {} threads", config.backgroundThreadCount());
-        LOG.info("[S1ind] Distant Passive Mob AI Throttling: {}", config.throttleDistantPassiveMobAi() ? "ON" : "OFF");
-        LOG.info("[S1ind] Light Update Early Exit: {}", config.fastLightUpdates() ? "ON" : "OFF");
-        LOG.info("[S1ind] Memory Pressure Watchdog: {}", config.autoMemoryClean() ? "ON (Threshold: " + config.memoryPressureThresholdPercent() + "%)" : "OFF (default)");
+        LOG.info("[S1ind] Background Worker Budget: {} threads", config.backgroundThreadCount());
+        LOG.info("[S1ind] Tiered Passive Mob AI Throttling: {}", config.throttleDistantPassiveMobAi() ? "ACTIVE (>16b adaptive)" : "DISABLED");
+        LOG.info("[S1ind] Light Fast-Path: {}", config.fastLightUpdates() ? "ENABLED" : "DISABLED");
 
         if (FabricLoader.getInstance().getEnvironmentType() == EnvType.SERVER && config.autoMemoryClean()) {
             MemoryCleaner.start();

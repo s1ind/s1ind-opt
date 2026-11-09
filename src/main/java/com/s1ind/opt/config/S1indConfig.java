@@ -10,48 +10,46 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 
 /**
- * Configuration for S1ind Optimizer v2.5.0.
+ * Configuration for S1ind Optimizer v3.0.0.
  * Persists as JSON in config/s1ind_opt.json.
  */
 public class S1indConfig {
 
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
 
+    // ── Profile ──────────────────────────────────────────────────
+    private PerformanceProfile profile = PerformanceProfile.BALANCED;
+
+    // ── Adaptive Performance Engine (APE) ─────────────────────────
+    /** Dynamically monitors frame jitter, 1% Low FPS, and scales background tasks. */
+    private boolean enableAdaptiveEngine = true;
+
+    /** Shows real-time 1% Low, 0.1% Low, and MSPT on the F3 debug screen. */
+    private boolean enableF3Telemetry = true;
+
     // ── Thread & Rendering Settings ──────────────────────────────
-    /**
-     * Elevates the Render Thread priority to Thread.MAX_PRIORITY (10).
-     * Gives OS scheduler priority bias to frame rendering over background tasks.
-     */
+    /** Elevates the Render Thread priority to Thread.MAX_PRIORITY (10). */
     private boolean boostRenderThreadPriority = true;
 
-    /**
-     * Lowers background worker threads (ForkJoin & IO) to Thread.NORM_PRIORITY - 1 (4).
-     */
+    /** Lowers background worker threads (ForkJoin & IO) to Thread.NORM_PRIORITY - 1 (4). */
     private boolean lowerBackgroundThreadPriority = true;
 
-    /**
-     * Background worker thread limit for Minecraft (0 = auto-calculate).
-     */
+    /** Background worker thread limit (0 = auto-calculate). */
     private int backgroundThreadCount = 0;
 
     // ── Entity Settings ──────────────────────────────────────────
-    /**
-     * Throttles AI pathfinding updates strictly for PASSIVE mobs (animals, villagers)
-     * when they are farther than 32 blocks from players.
-     */
+    /** Throttles AI pathfinding updates strictly for PASSIVE mobs outside player radius. */
     private boolean throttleDistantPassiveMobAi = true;
 
+    /** Distance in blocks beyond which passive mobs receive tiered throttling. */
+    private double passiveMobDistanceThreshold = 32.0;
+
     // ── Lighting Settings ────────────────────────────────────────
-    /**
-     * Early-exit fast-path for LightingProvider when no lighting updates are queued.
-     */
+    /** Early-exit fast-path for LightingProvider when no lighting updates are queued. */
     private boolean fastLightUpdates = true;
 
     // ── Memory Settings ──────────────────────────────────────────
-    /**
-     * Background memory watchdog.
-     * Disabled by default: Recommended only for memory-constrained setups (<=3 GB heap).
-     */
+    /** Emergency memory watchdog (disabled by default, recommended for <=3GB heap). */
     private boolean autoMemoryClean = false;
 
     /** Interval in seconds between memory pressure checks (default: 30s). */
@@ -62,13 +60,17 @@ public class S1indConfig {
 
     // ── Accessors ────────────────────────────────────────────────
 
-    public boolean boostRenderThreadPriority()       { return boostRenderThreadPriority; }
-    public boolean lowerBackgroundThreadPriority()   { return lowerBackgroundThreadPriority; }
-    public boolean throttleDistantPassiveMobAi()      { return throttleDistantPassiveMobAi; }
-    public boolean fastLightUpdates()                { return fastLightUpdates; }
-    public boolean autoMemoryClean()                 { return autoMemoryClean; }
-    public int     memoryCheckIntervalSeconds()      { return Math.max(10, memoryCheckIntervalSeconds); }
-    public int     memoryPressureThresholdPercent()  { return Math.min(95, Math.max(70, memoryPressureThresholdPercent)); }
+    public PerformanceProfile profile()                  { return profile != null ? profile : PerformanceProfile.BALANCED; }
+    public boolean enableAdaptiveEngine()               { return profile != PerformanceProfile.COMPATIBILITY && enableAdaptiveEngine; }
+    public boolean enableF3Telemetry()                  { return enableF3Telemetry; }
+    public boolean boostRenderThreadPriority()          { return profile != PerformanceProfile.COMPATIBILITY && boostRenderThreadPriority; }
+    public boolean lowerBackgroundThreadPriority()      { return profile != PerformanceProfile.COMPATIBILITY && lowerBackgroundThreadPriority; }
+    public boolean throttleDistantPassiveMobAi()         { return profile != PerformanceProfile.COMPATIBILITY && throttleDistantPassiveMobAi; }
+    public double  passiveMobDistanceThreshold()         { return Math.max(16.0, Math.min(128.0, passiveMobDistanceThreshold)); }
+    public boolean fastLightUpdates()                   { return profile != PerformanceProfile.COMPATIBILITY && fastLightUpdates; }
+    public boolean autoMemoryClean()                    { return autoMemoryClean; }
+    public int     memoryCheckIntervalSeconds()         { return Math.max(10, memoryCheckIntervalSeconds); }
+    public int     memoryPressureThresholdPercent()     { return Math.min(95, Math.max(70, memoryPressureThresholdPercent)); }
 
     /**
      * Intelligently budgets background worker threads based on available CPU cores:
