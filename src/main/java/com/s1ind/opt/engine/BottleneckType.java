@@ -1,18 +1,21 @@
 package com.s1ind.opt.engine;
 
 /**
- * Identifies the primary bottleneck detected by the Adaptive Performance Engine.
+ * Identifies the suspected bottleneck category observed by the Adaptive Performance Engine.
+ *
+ *Note: Client render detection measures client render loop frame latency without
+ * hardware GPU telemetry (which could indicate shader overhead, VSync, CPU render thread, or GPU load).
  */
 public enum BottleneckType {
-    /** Frame rate and tick time are healthy. */
+    /** Frame times and server tick times are within healthy thresholds. */
     BALANCED,
 
-    /** Server logic thread MSPT exceeds threshold (>40ms) while client render is responsive. */
+    /** Local server tick MSPT exceeds 38.0ms (CPU simulation bound). */
     CPU_TICK_BOUND,
 
-    /** Client frame time is slow (>22ms) while server MSPT is healthy (<25ms). */
-    RENDER_GPU_BOUND,
+    /** Client frame time exceeds target frame budget (>22ms) while local tick MSPT is <28ms (or remote). */
+    CLIENT_RENDER_BOUND,
 
-    /** Significant Stop-The-World GC pause occurred (>50ms) recently. */
+    /** Recent Garbage Collector cycle duration exceeded 50ms within the rolling 60s window. */
     GC_BOUND
 }

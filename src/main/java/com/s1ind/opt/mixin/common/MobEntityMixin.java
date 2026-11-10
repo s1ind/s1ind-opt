@@ -11,6 +11,7 @@ import net.minecraft.entity.passive.AnimalEntity;
 import net.minecraft.entity.passive.MerchantEntity;
 import net.minecraft.entity.passive.PassiveEntity;
 import net.minecraft.entity.passive.TameableEntity;
+import net.minecraft.entity.player.PlayerEntity;
 import net.minecraft.util.Identifier;
 import net.minecraft.world.World;
 import org.spongepowered.asm.mixin.Mixin;
@@ -20,22 +21,23 @@ import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
+import java.util.List;
+
 /**
  * Heuristic-guarded AI throttling strictly for vanilla passive entities.
  *
- * Explicit Exclusions (Never throttled):
- * - All hostile mobs (Zombies, Creepers, Skeletons, etc.)
- * - Third-party modded entities (if protectModdedEntities=true)
- * - Villagers & Wandering Traders (MerchantEntity, if protectVillagerAi=true)
- * - Tamed pets (TameableEntity.isTamed)
- * - Custom named mobs (hasCustomName)
- * - Leashed or mounted/riding mobs
- * - Breeding animals (isInLove)
- * - Mobs panicking or actively targeted in combat
- * - Entities within 16 blocks of a player
+ * Guarantees & Safety Guards:
+ * - Zero stale distance cache: evaluates exact squared player distance every tick
+ *   via allocation-free indexed loop so approaching within 16 blocks restores
+ *   vanilla AI on the very same tick.
+ * - Never throttles: hostile mobs, villagers/merchants (by default), third-party
+ *   modded entities (by default), tamed pets, custom-named, leashed, riding,
+ *   breeding animals, or mobs actively panicking/in combat.
  */
 @Mixin(MobEntity.class)
 public abstract class MobEntityMixin extends LivingEntity {
+
+    private static final double INTERACTION_RADIUS_SQ = 16.0 * 16.0; // 256.0
 
     protected MobEntityMixin(EntityType<? extends LivingEntity> entityType, World world) {
         super(entityType, world);
@@ -48,9 +50,6 @@ public abstract class MobEntityMixin extends LivingEntity {
     private int s1ind$skipCounter = 0;
 
     @Unique
-    private double s1ind$cachedPlayerDistance = 0.0;
-
-    @Unique
     private Boolean s1ind$isEligibleVanillaPassive = null;
 
     @Inject(method = "tickNewAi", at = @At("HEAD"), cancellable = true)
@@ -60,7 +59,7 @@ public abstract class MobEntityMixin extends LivingEntity {
             return;
         }
 
-        // One-time eligibility check per entity lifetime (zero repeat allocations)
+        // One-time entity eligibility check per lifetime
         if (s1ind$isEligibleVanillaPassive == null) {
             if (!((Object) this instanceof PassiveEntity)) {
                 s1ind$isEligibleVanillaPassive = false;
@@ -94,21 +93,27 @@ public abstract class MobEntityMixin extends LivingEntity {
         if ((Object) this instanceof AnimalEntity animal && animal.isInLove()) return;
         if (this.getTarget() != null || this.getAttacker() != null) return;
 
-        // Refresh player distance every 32 ticks (spread by entity ID)
-        if (((this.age + this.getId()) & 31) == 0) {
-            World world = this.getEntityWorld();
-            if (world != null) {
-                var player = world.getClosestPlayer(this, 128.0);
-                s1ind$cachedPlayerDistance = player != null ? Math.sqrt(this.squaredDistanceTo(player)) : 999.0;
+        World world = this.getEntityWorld();
+        if (world == null) return;
+
+        // Instant zero-allocation squared-distance check across non-spectator players
+        double minDistSq = Double.MAX_VALUE;
+        List<? extends PlayerEntity> players = world.getPlayers();
+        for (int i = 0, len = players.size(); i < len; i++) {
+            PlayerEntity p = players.get(i);
+            if (!p.isSpectator()) {
+                double dSq = this.squaredDistanceTo(p);
+                if (dSq < minDistSq) {
+                    minDistSq = dSq;
+                    if (minDistSq <= INTERACTION_RADIUS_SQ) {
+                        return; // Instant exit within 16 blocks: 0-tick lag guarantee
+                    }
+                }
             }
         }
 
-        // Interaction zone (< 16 blocks): 100% vanilla fidelity
-        if (s1ind$cachedPlayerDistance < 16.0) {
-            return;
-        }
-
         double threshold = cfg.passiveMobDistanceThreshold();
+        double thresholdSq = threshold * threshold;
         StressLevel stress = cfg.enableAdaptiveEngine()
             ? AdaptivePerformanceEngine.getInstance().getStressLevel()
             : StressLevel.NORMAL;
@@ -116,14 +121,14 @@ public abstract class MobEntityMixin extends LivingEntity {
         s1ind$skipCounter++;
 
         // Intermediate zone: 16 to threshold blocks
-        if (s1ind$cachedPlayerDistance < threshold) {
+        if (minDistSq < thresholdSq) {
             if (stress == StressLevel.CRITICAL && (s1ind$skipCounter & 1) != 0) {
                 ci.cancel();
             }
             return;
         }
 
-        // Distant zone: > threshold blocks (default 32+)
+        // Distant zone: > threshold blocks
         switch (stress) {
             case CRITICAL -> {
                 if ((s1ind$skipCounter & 3) != 0) {

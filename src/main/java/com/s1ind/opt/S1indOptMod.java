@@ -1,6 +1,7 @@
 package com.s1ind.opt;
 
 import com.s1ind.opt.config.S1indConfig;
+import com.s1ind.opt.engine.AdaptivePerformanceEngine;
 import com.s1ind.opt.memory.MemoryCleaner;
 import net.fabricmc.api.EnvType;
 import net.fabricmc.api.ModInitializer;
@@ -19,15 +20,24 @@ public class S1indOptMod implements ModInitializer {
     public void onInitialize() {
         config = S1indConfig.load();
 
-        LOG.info("[S1ind] Initializing S1ind Optimizer v3.1.0 (Adaptive Performance Engine)");
+        LOG.info("[S1ind] Initializing S1ind Optimizer v3.2.0 (Adaptive Performance Engine)");
         LOG.info("[S1ind] Active Profile: {}", config.profile());
-        LOG.info("[S1ind] Adaptive Performance Engine: {}", config.enableAdaptiveEngine() ? "ACTIVE" : "DISABLED");
-        LOG.info("[S1ind] In-game F3 Telemetry (1% / 0.1% Low): {}", config.enableF3Telemetry() ? "ENABLED" : "DISABLED");
-        LOG.info("[S1ind] Render Thread Priority: {}", config.boostRenderThreadPriority() ? "MAX (10)" : "DEFAULT (5)");
-        LOG.info("[S1ind] Worker Thread Priority: {}", config.lowerBackgroundThreadPriority() ? "NORM-1 (4)" : "DEFAULT (5)");
-        LOG.info("[S1ind] Background Worker Budget: {} threads", config.backgroundThreadCount());
-        LOG.info("[S1ind] Tiered Passive Mob AI Throttling: {}", config.throttleDistantPassiveMobAi() ? "ACTIVE (>16b adaptive)" : "DISABLED");
+        LOG.info("[S1ind] Adaptive Performance Engine: {}", config.enableAdaptiveEngine() ? "ACTIVE" : "MONITOR_ONLY");
+        LOG.info("[S1ind] In-game F3 Telemetry: {}", config.enableF3Telemetry() ? "ENABLED" : "DISABLED");
+        LOG.info("[S1ind] Thread Scheduler Overrides: Render={}, Workers={}, Budget={}",
+            config.boostRenderThreadPriority() ? "MAX (10)" : "VANILLA",
+            config.lowerBackgroundThreadPriority() ? "NORM-1 (4)" : "VANILLA",
+            config.backgroundThreadCount() > 0 ? config.backgroundThreadCount() + " threads" : "VANILLA"
+        );
+        LOG.info("[S1ind] Tiered Passive Mob AI Throttling: {}",
+            config.throttleDistantPassiveMobAi()
+                ? "ACTIVE (threshold=" + config.passiveMobDistanceThreshold() + "b, villagersProtected=" + config.protectVillagerAi() + ")"
+                : "DISABLED"
+        );
         LOG.info("[S1ind] Light Fast-Path: {}", config.fastLightUpdates() ? "ENABLED" : "DISABLED");
+
+        // Start APE worker and AdaptiveTaskScheduler on ALL environments (Client & Dedicated Server)
+        AdaptivePerformanceEngine.getInstance().startBackgroundWorker();
 
         if (FabricLoader.getInstance().getEnvironmentType() == EnvType.SERVER && config.autoMemoryClean()) {
             MemoryCleaner.start();

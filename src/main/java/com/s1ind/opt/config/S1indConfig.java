@@ -2,6 +2,7 @@ package com.s1ind.opt.config;
 
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
+import com.google.gson.JsonParseException;
 import com.s1ind.opt.S1indOptMod;
 import net.fabricmc.loader.api.FabricLoader;
 
@@ -10,7 +11,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 
 /**
- * Configuration for S1ind Optimizer v3.1.0.
+ * Configuration for S1ind Optimizer v3.2.0.
  * Persists as JSON in config/s1ind_opt.json.
  */
 public class S1indConfig {
@@ -21,10 +22,10 @@ public class S1indConfig {
     private PerformanceProfile profile = PerformanceProfile.BALANCED;
 
     // ── Adaptive Performance Engine (APE) ─────────────────────────
-    /** Dynamically monitors frame jitter, 1% / 0.1% Low FPS, and scales throttling. */
+    /** Enables adaptive load shedding based on frame / MSPT stress. Telemetry runs regardless. */
     private boolean enableAdaptiveEngine = true;
 
-    /** Shows real-time metrics (1% Low, 0.1% Low, MSPT, GC) on F3 debug screen. */
+    /** Shows live metrics (1% Low, 0.1% Low, MSPT, GC) on F3 debug screen. */
     private boolean enableF3Telemetry = true;
 
     // ── Thread & Scheduling Settings ─────────────────────────────
@@ -34,11 +35,11 @@ public class S1indConfig {
     /** Lowers background worker threads (ForkJoin & IO) to Thread.NORM_PRIORITY - 1 (4). */
     private boolean lowerBackgroundThreadPriority = true;
 
-    /** Background worker thread limit (0 = auto-calculate). */
+    /** Background worker thread limit (0 = auto-calculate based on profile and logical processors). */
     private int backgroundThreadCount = 0;
 
     // ── Safe AI Scheduler Settings ───────────────────────────────
-    /** Heuristic throttling for distant passive mobs beyond player radius. */
+    /** Heuristic throttling for distant passive mobs outside player radius. */
     private boolean throttleDistantPassiveMobAi = true;
 
     /** Protects villagers and wandering traders from AI throttling (preserves iron farms/trades). */
@@ -67,37 +68,54 @@ public class S1indConfig {
     // ── Accessors ────────────────────────────────────────────────
 
     public PerformanceProfile profile()                  { return profile != null ? profile : PerformanceProfile.BALANCED; }
-    public boolean enableAdaptiveEngine()               { return profile != PerformanceProfile.COMPATIBILITY && enableAdaptiveEngine; }
+    public boolean enableAdaptiveEngine()               { return profile() != PerformanceProfile.COMPATIBILITY && enableAdaptiveEngine; }
     public boolean enableF3Telemetry()                  { return enableF3Telemetry; }
-    public boolean boostRenderThreadPriority()          { return profile != PerformanceProfile.COMPATIBILITY && boostRenderThreadPriority; }
-    public boolean lowerBackgroundThreadPriority()      { return profile != PerformanceProfile.COMPATIBILITY && lowerBackgroundThreadPriority; }
-    public boolean throttleDistantPassiveMobAi()         { return profile != PerformanceProfile.COMPATIBILITY && throttleDistantPassiveMobAi; }
+    public boolean boostRenderThreadPriority()          { return profile() != PerformanceProfile.COMPATIBILITY && boostRenderThreadPriority; }
+    public boolean lowerBackgroundThreadPriority()      { return profile() != PerformanceProfile.COMPATIBILITY && lowerBackgroundThreadPriority; }
+    public boolean throttleDistantPassiveMobAi()         { return profile() != PerformanceProfile.COMPATIBILITY && throttleDistantPassiveMobAi; }
     public boolean protectVillagerAi()                  { return protectVillagerAi; }
     public boolean protectModdedEntities()              { return protectModdedEntities; }
-    public double  passiveMobDistanceThreshold()         { return Math.max(16.0, Math.min(128.0, passiveMobDistanceThreshold)); }
-    public boolean fastLightUpdates()                   { return profile != PerformanceProfile.COMPATIBILITY && fastLightUpdates; }
+    public boolean fastLightUpdates()                   { return profile() != PerformanceProfile.COMPATIBILITY && fastLightUpdates; }
     public boolean autoMemoryClean()                    { return autoMemoryClean; }
     public int     memoryCheckIntervalSeconds()         { return Math.max(10, memoryCheckIntervalSeconds); }
     public int     memoryPressureThresholdPercent()     { return Math.min(95, Math.max(70, memoryPressureThresholdPercent)); }
 
+    public double passiveMobDistanceThreshold() {
+        double configured = Math.max(18.0, Math.min(128.0, passiveMobDistanceThreshold));
+        if (profile() == PerformanceProfile.PERFORMANCE) {
+            return Math.min(configured, 24.0);
+        }
+        return configured;
+    }
+
     /**
-     * Budgets background worker threads based on available logical cores:
-     * - Dual-core (<=2 cores): 1 worker
-     * - Quad-core (3-4 cores): cores - 1
-     * - Multi-core (5+ cores): cores - 2, capped at 8
+     * Budgets background worker threads based on logical processor count available to JVM
+     * (note: Runtime.availableProcessors() reports logical threads, not physical topology):
+     * - COMPATIBILITY profile: returns 0 (does not override Vanilla worker count).
+     * - BALANCED: preserves 1-2 logical CPUs for primary game/render threads.
+     * - PERFORMANCE: aggressively caps background workers to max 4 threads to reduce contention.
      */
     public int backgroundThreadCount() {
-        int availableCores = Runtime.getRuntime().availableProcessors();
-        if (backgroundThreadCount <= 0) {
-            if (availableCores <= 2) {
-                return 1;
-            } else if (availableCores <= 4) {
-                return availableCores - 1;
-            } else {
-                return Math.min(availableCores - 2, 8);
-            }
+        if (profile() == PerformanceProfile.COMPATIBILITY) {
+            return 0; // Do not touch Vanilla worker count in compatibility mode
         }
-        return Math.min(backgroundThreadCount, availableCores);
+
+        int logicalProcs = Runtime.getRuntime().availableProcessors();
+        if (backgroundThreadCount <= 0) {
+            int autoCount;
+            if (logicalProcs <= 2) {
+                autoCount = 1;
+            } else if (logicalProcs <= 4) {
+                autoCount = logicalProcs - 1;
+            } else {
+                autoCount = Math.min(logicalProcs - 2, 8);
+            }
+            if (profile() == PerformanceProfile.PERFORMANCE) {
+                return Math.min(autoCount, 4);
+            }
+            return autoCount;
+        }
+        return Math.min(backgroundThreadCount, logicalProcs);
     }
 
     // ── Persistence ──────────────────────────────────────────────
@@ -112,8 +130,12 @@ public class S1indConfig {
                     cfg.save();
                     return cfg;
                 }
-            } catch (IOException e) {
-                S1indOptMod.LOG.warn("[S1ind] Failed to read config, using defaults", e);
+            } catch (IOException | JsonParseException | IllegalStateException e) {
+                S1indOptMod.LOG.warn("[S1ind] Corrupt or unreadable config at {}, backing up and resetting to defaults", path, e);
+                try {
+                    Files.copy(path, path.resolveSibling("s1ind_opt.json.bak"), java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                } catch (IOException ignored) {
+                }
             }
         }
         S1indConfig cfg = new S1indConfig();

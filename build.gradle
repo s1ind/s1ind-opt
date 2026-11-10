@@ -14,10 +14,6 @@ repositories {
     mavenCentral()
 }
 
-loom {
-    accessWidenerPath = file("src/main/resources/s1ind_opt.accesswidener")
-}
-
 dependencies {
     // Minecraft & mappings
     minecraft "com.mojang:minecraft:${project.minecraft_version}"
@@ -58,4 +54,8 @@ jar {
     from("LICENSE") {
         rename { "${it}_${project.base.archivesName.get()}" }
     }
+}
+
+sourcesJar {
+    from(sourceSets.test.allSource)
 }
