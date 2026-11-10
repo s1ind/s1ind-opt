@@ -13,8 +13,8 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 import java.util.List;
 
 /**
- * Injects pre-computed APE telemetry snapshots into F3 Debug HUD.
- * Performs zero String formatting and zero object allocations per rendered frame.
+ * Injects pre-built immutable APE telemetry snapshots into F3 Debug HUD.
+ * Performs no String.format() and no allocations per rendered frame.
  */
 @Mixin(DebugHud.class)
 public abstract class DebugHudMixin {
@@ -26,6 +26,7 @@ public abstract class DebugHudMixin {
             text.add("");
             text.add(snap.f3Line1());
             text.add(snap.f3Line2());
+            text.add(snap.f3Line3());
         }
     }
 }

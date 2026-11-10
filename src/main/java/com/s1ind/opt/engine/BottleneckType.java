@@ -1,22 +1,21 @@
 package com.s1ind.opt.engine;
 
 /**
- * Primary suspected performance bottleneck classification.
- *
- * Notice: Without hardware GPU driver telemetry (NVML/ADL/DXGI), client frame
- * bottlenecks are conservatively labeled CLIENT_RENDER_BOUND or UNKNOWN rather
- * than making unverified hardware claims.
+ * Bottleneck classification reported by AdaptivePerformanceEngine.
  */
 public enum BottleneckType {
-    /** Server simulation tick MSPT exceeds healthy thresholds while render frames remain fast. */
-    CPU_BOUND,
+    /** Insufficient telemetry samples (e.g. INITIALIZING or missing both frame/tick data). */
+    UNKNOWN,
 
-    /** Client frame durations exceed frame target while server logic ticks remain healthy (or remote). */
+    /** Integrated or dedicated server tick time (MSPT) exceeds healthy simulation budget. */
+    SERVER_TICK_BOUND,
+
+    /** Client render loop frame time exceeds target FPS budget while local logic MSPT is healthy. */
     CLIENT_RENDER_BOUND,
 
-    /** Significant Garbage Collector cycles detected within the rolling 60s window. */
+    /** Frequent or sustained Garbage Collector cycles detected within the rolling 60s window. */
     GC_PRESSURE,
 
-    /** System is healthy/balanced or insufficient/ambiguous signals exist to blame a single subsystem. */
-    UNKNOWN
+    /** Telemetry confirms frame rate and simulation ticks are within healthy bounds. */
+    NO_CLEAR_BOTTLENECK
 }

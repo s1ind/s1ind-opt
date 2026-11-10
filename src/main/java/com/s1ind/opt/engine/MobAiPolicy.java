@@ -3,10 +3,11 @@ package com.s1ind.opt.engine;
 /**
  * Pure heuristic policy deciding whether a passive mob AI tick may be skipped.
  *
- * Strictly enforces:
- * - Zero throttling within <= 16.0 blocks (including exact 16.0 boundary).
- * - Conservative throttling in 16..threshold range only under CRITICAL load.
- * - Tiered shedding beyond threshold (NORMAL: 1/2, MODERATE: 2/3, CRITICAL: 3/4).
+ * Enforces:
+ * - Strict protection <= 16.0 blocks (including exact 16.0 boundary).
+ * - Protection of saddled entities independently of passenger presence.
+ * - Protection of villagers/merchants, golems, tamed, leashed, riding, breeding,
+ *   combat/panicking, custom-named, and modded entities.
  */
 public final class MobAiPolicy {
 
@@ -38,6 +39,7 @@ public final class MobAiPolicy {
     public static boolean hasDynamicProtection(
         boolean hasCustomName,
         boolean isLeashed,
+        boolean hasSaddleEquipped,
         boolean hasPassengers,
         boolean hasVehicle,
         boolean isTamed,
@@ -46,6 +48,7 @@ public final class MobAiPolicy {
     ) {
         return hasCustomName
             || isLeashed
+            || hasSaddleEquipped
             || hasPassengers
             || hasVehicle
             || isTamed
@@ -54,7 +57,7 @@ public final class MobAiPolicy {
     }
 
     /**
-     * Computes whether this AI tick should be skipped given the closest non-spectator player squared distance.
+     * Computes whether this AI tick should be skipped given closest non-spectator player squared distance.
      */
     public static boolean shouldSkipTick(
         double minDistSq,
@@ -62,19 +65,16 @@ public final class MobAiPolicy {
         StressLevel stress,
         int skipCounter
     ) {
-        // Guaranteed interaction zone: <= 16.0 blocks is NEVER throttled
         if (minDistSq <= INTERACTION_RADIUS_SQ) {
             return false;
         }
 
         double thresholdSq = thresholdBlocks * thresholdBlocks;
 
-        // Intermediate zone: (16, threshold) blocks
         if (minDistSq < thresholdSq) {
             return stress == StressLevel.CRITICAL && (skipCounter & 1) != 0;
         }
 
-        // Far zone: >= threshold blocks
         return switch (stress) {
             case CRITICAL -> (skipCounter & 3) != 0; // Skip 3 of 4
             case MODERATE -> (skipCounter % 3) != 0; // Skip 2 of 3

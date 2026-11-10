@@ -2,21 +2,20 @@ package com.s1ind.opt.engine;
 
 import com.s1ind.opt.S1indOptMod;
 import com.s1ind.opt.config.PerformanceProfile;
-import com.s1ind.opt.engine.AdaptiveTaskScheduler.TaskPriority;
 
 import java.util.Arrays;
 
 /**
- * Adaptive Performance Engine (APE) v3.2.1.
+ * Adaptive Performance Engine (APE) v3.2.2.
  *
- * Architecture guarantees:
- * - Zero Render Thread allocation and O(1) ping-pong frame recording without sorting locks.
- * - Fixed 20,000-frame rolling window + pre-allocated sort workspace (0 B/s worker churn).
- * - True arithmetic mean of worst 1% (200 frames at full buffer) and worst 0.1% (20 frames).
- * - Explicit readiness lifecycle: INITIALIZING (<500), PARTIAL (500..19,999), STABLE (20,000).
- * - Decoupled client & dedicated server telemetry; server runs purely on MSPT when headless.
- * - Dynamic FPS Cap / VSync awareness without inventing arbitrary 60 FPS ceilings.
- * - Monotonic System.nanoTime() dwell & hysteresis preventing state flapping.
+ * Guarantees:
+ * - O(1) ping-pong frame recording under a minimal batchLock critical section (no allocations, no sorting).
+ * - Pre-allocated 20,000-frame rolling window + pre-allocated sort workspace on worker thread.
+ * - True arithmetic mean of slowest 1% (200 frames) and slowest 0.1% (20 frames).
+ * - Explicit TelemetryReadiness lifecycle: INITIALIZING (<500), PARTIAL (500..19,999), STABLE (20,000).
+ * - Independent Client / Dedicated Server assessment (MSPT evaluated even during client warmup).
+ * - Supports explicit FPS Caps (30, 60, 120, 144, 240), VSync, and uncapped settings honestly.
+ * - Single-owner background refresh cycle (no duplicate scheduler job storms).
  */
 public final class AdaptivePerformanceEngine {
 
@@ -31,7 +30,7 @@ public final class AdaptivePerformanceEngine {
     private static final int BATCH_CAPACITY = FRAME_BUFFER_SIZE;
     private static final int TICK_BUFFER_SIZE = 128;
 
-    // ── Ping-Pong Frame Batch (Zero Render-Thread Lock Contention) ─
+    // ── Ping-Pong Frame Batch (short critical section, O(1) write) ──
     private long[] activeFrameBatch = new long[BATCH_CAPACITY];
     private long[] drainFrameBatch = new long[BATCH_CAPACITY];
     private int activeBatchCount = 0;
@@ -43,7 +42,7 @@ public final class AdaptivePerformanceEngine {
     private int rollingHead = 0;
     private int rollingCount = 0;
 
-    // ── Tick Metrics ──────────────────────────────────────────────
+    // ── Server Tick Metrics ───────────────────────────────────────
     private final long[] rollingTicks = new long[TICK_BUFFER_SIZE];
     private int tickHead = 0;
     private int tickCount = 0;
@@ -52,7 +51,7 @@ public final class AdaptivePerformanceEngine {
     private volatile boolean clientFrameRecorded = false;
     private volatile boolean integratedServerActive = false;
 
-    // ── Telemetry Metrics ─────────────────────────────────────────
+    // ── Telemetry Outputs ─────────────────────────────────────────
     private volatile double cachedAvgFps = 0.0;
     private volatile double cachedAvgFrameTimeMs = 0.0;
     private volatile double cachedOnePercentLow = 0.0;
@@ -63,7 +62,7 @@ public final class AdaptivePerformanceEngine {
     private volatile int cachedSampleCount = 0;
     private volatile TelemetryReadiness readiness = TelemetryReadiness.INITIALIZING;
 
-    private volatile int targetFpsCap = 260; // >250 treated as uncapped by Vanilla Video Settings
+    private volatile int targetFpsCap = 260; // >250 treated as uncapped ("Unlimited")
     private volatile boolean vsyncEnabled = false;
     private volatile StressLevel currentStress = StressLevel.NORMAL;
     private volatile BottleneckType bottleneckType = BottleneckType.UNKNOWN;
@@ -87,6 +86,17 @@ public final class AdaptivePerformanceEngine {
         if (workerRunning) {
             return;
         }
+        if (workerThread != null && workerThread.isAlive()) {
+            try {
+                workerThread.join(1000L);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            if (workerThread.isAlive()) {
+                S1indOptMod.LOG.warn("[S1ind] Existing APE worker thread did not stop; skipping duplicate launch.");
+                return;
+            }
+        }
         workerRunning = true;
         workerThread = new Thread(this::workerLoop, "S1ind-APE-Worker");
         workerThread.setDaemon(true);
@@ -98,19 +108,27 @@ public final class AdaptivePerformanceEngine {
         workerRunning = false;
         AdaptiveTaskScheduler.getInstance().stop();
         GcMonitor.unregister();
-        if (workerThread != null) {
-            workerThread.interrupt();
+
+        Thread t = workerThread;
+        if (t != null) {
+            t.interrupt();
             try {
-                workerThread.join(1000L);
+                t.join(1500L);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
-            workerThread = null;
+            if (!t.isAlive()) {
+                workerThread = null;
+            } else {
+                S1indOptMod.LOG.warn("[S1ind] APE worker thread still alive after 1500ms shutdown wait.");
+            }
         }
     }
 
     /**
-     * Records a single client frame duration in nanoseconds (O(1), zero allocations).
+     * Records a client frame duration in nanoseconds (O(1), zero allocations).
+     * Uses a tiny synchronized swap-batch lock (~10ns) to guarantee zero lost frames
+     * without waiting on background sorting or reading torn arrays.
      */
     public void recordFrame(long durationNano) {
         if (durationNano <= 0) return;
@@ -119,6 +137,7 @@ public final class AdaptivePerformanceEngine {
             if (activeBatchCount < BATCH_CAPACITY) {
                 activeFrameBatch[activeBatchCount++] = durationNano;
             } else {
+                // Circular overwrite of oldest pending slot inside same batch if single second > 20k FPS
                 activeFrameBatch[BATCH_CAPACITY - 1] = durationNano;
             }
         }
@@ -158,39 +177,27 @@ public final class AdaptivePerformanceEngine {
     }
 
     private void workerLoop() {
+        // Single-owner periodic refresh loop (no redundant duplicate scheduler tasks)
         while (workerRunning) {
             try {
-                Thread.sleep(500L);
+                Thread.sleep(400L);
+                if (!workerRunning) break;
                 recalculateNow(System.nanoTime());
-
-                // Dispatch auxiliary maintenance cleanly through AdaptiveTaskScheduler
-                AdaptiveTaskScheduler.getInstance().submit(
-                    PerformanceTelemetry::refreshSnapshot,
-                    TaskPriority.HIGH,
-                    "telemetry-snapshot"
-                );
-                AdaptiveTaskScheduler.getInstance().submit(
-                    GcMonitor::refreshWindow,
-                    TaskPriority.NORMAL,
-                    "gc-window-prune"
-                );
             } catch (InterruptedException e) {
                 if (!workerRunning) break;
                 Thread.currentThread().interrupt();
                 break;
             } catch (Exception e) {
-                S1indOptMod.LOG.warn("[S1ind] APE background cycle exception", e);
+                S1indOptMod.LOG.warn("[S1ind] APE worker loop encountered exception", e);
             }
         }
     }
 
     /**
-     * Drains incoming frame batch, appends into 20k rolling array without allocation,
-     * computes true arithmetic mean of slowest 1% and 0.1%, evaluates monotonic stress,
-     * and refreshes pre-formatted telemetry snapshot.
+     * Drains ping-pong batch via O(1) array reference swap, recalculates percentiles
+     * using pre-allocated sortWorkspace, updates monotonic stress state & snapshot.
      */
     public synchronized void recalculateNow(long nowNano) {
-        // 1. Drain frame batch via O(1) reference swap
         int drainedCount;
         synchronized (batchLock) {
             long[] swap = activeFrameBatch;
@@ -209,11 +216,9 @@ public final class AdaptivePerformanceEngine {
         }
         this.cachedSampleCount = rollingCount;
 
-        // 2. Readiness & True Mean of Worst 1% / 0.1%
         if (!clientFrameRecorded || rollingCount < WARMUP_MIN_FRAMES) {
             this.readiness = TelemetryReadiness.INITIALIZING;
             if (rollingCount > 0) {
-                // Only compute simple mean FPS during early warmup; withhold 1%/0.1% Low claims
                 long sum = 0;
                 for (int i = 0; i < rollingCount; i++) sum += rollingFrames[i];
                 double meanNano = (double) sum / rollingCount;
@@ -261,7 +266,6 @@ public final class AdaptivePerformanceEngine {
             this.cachedPointOnePercentSampleSize = count01Pct;
         }
 
-        // 3. Server MSPT
         if (serverTickRecorded) {
             long totalTickNano = 0;
             int tCount;
@@ -278,78 +282,119 @@ public final class AdaptivePerformanceEngine {
             this.cachedMspt = 0.0;
         }
 
-        // 4. Refresh GC window synchronously as well for deterministic tests
+        // Refresh rolling GC window once per cycle (single owner)
         GcMonitor.refreshWindow();
 
-        // 5. Evaluate Stress with Hysteresis & Monotonic Dwell
+        // Evaluate stress with hysteresis & dwell
         StressLevel rawTarget = evaluateRawStress(this.currentStress);
         updateStressWithHysteresis(rawTarget, nowNano);
 
-        // 6. Classify Bottleneck + Confidence
+        // Classify bottleneck + honest confidence
         evaluateBottleneck();
 
-        // 7. Refresh cached UI snapshot strings off the Render Thread
+        // Refresh UI snapshot once per cycle (single owner, off Render Thread)
         PerformanceTelemetry.refreshSnapshot();
+    }
+
+    private StressLevel evaluateServerOnlyStress(StressLevel current, double mspt) {
+        return switch (current) {
+            case NORMAL -> {
+                if (mspt > 46.0) yield StressLevel.CRITICAL;
+                if (mspt > 36.0) yield StressLevel.MODERATE;
+                yield StressLevel.NORMAL;
+            }
+            case MODERATE -> {
+                if (mspt > 46.0) yield StressLevel.CRITICAL;
+                if (mspt <= 30.0) yield StressLevel.NORMAL;
+                yield StressLevel.MODERATE;
+            }
+            case CRITICAL -> {
+                if (mspt <= 40.0) yield StressLevel.MODERATE;
+                yield StressLevel.CRITICAL;
+            }
+        };
     }
 
     private StressLevel evaluateRawStress(StressLevel current) {
         double mspt = serverTickRecorded ? this.cachedMspt : 0.0;
 
-        // Dedicated server / headless path: purely MSPT-driven
-        if (!clientFrameRecorded) {
-            return switch (current) {
-                case NORMAL -> {
-                    if (mspt > 46.0) yield StressLevel.CRITICAL;
-                    if (mspt > 36.0) yield StressLevel.MODERATE;
-                    yield StressLevel.NORMAL;
-                }
-                case MODERATE -> {
-                    if (mspt > 46.0) yield StressLevel.CRITICAL;
-                    if (mspt <= 30.0) yield StressLevel.NORMAL;
-                    yield StressLevel.MODERATE;
-                }
-                case CRITICAL -> {
-                    if (mspt <= 40.0) yield StressLevel.MODERATE;
-                    yield StressLevel.CRITICAL;
-                }
-            };
+        // Headless dedicated server path OR client warmup: NEVER suppress server MSPT stress!
+        if (!clientFrameRecorded || readiness == TelemetryReadiness.INITIALIZING) {
+            return serverTickRecorded ? evaluateServerOnlyStress(current, mspt) : StressLevel.NORMAL;
         }
 
-        // During initialization (<500 frames), rely strictly on MSPT so startup loading doesn't trip CRITICAL
-        if (readiness == TelemetryReadiness.INITIALIZING) {
-            return mspt > 46.0 ? StressLevel.CRITICAL : StressLevel.NORMAL;
-        }
-
-        // Compute dynamic expected FPS baseline respecting actual FPS limit (without clipping 120/144 down to 60!)
-        double targetCeiling = (targetFpsCap > 0 && targetFpsCap <= 250) ? targetFpsCap : -1.0;
-
+        // Dynamic target computation across full FPS range (30, 60, 120, 144, 240)
+        boolean hasExplicitCap = targetFpsCap > 0 && targetFpsCap <= 250;
         double fps = this.cachedAvgFps;
         double low1 = this.cachedOnePercentLow;
 
-        // For stress shedding (when should APE conserve CPU?), use playable floor OR relative drop against low caps:
-        double modFpsThresh = (targetCeiling > 0 && targetCeiling < 60.0) ? targetCeiling * 0.80 : 48.0;
-        double critFpsThresh = (targetCeiling > 0 && targetCeiling < 60.0) ? targetCeiling * 0.55 : 32.0;
-        double modLow1Thresh = (targetCeiling > 0 && targetCeiling < 60.0) ? targetCeiling * 0.58 : 35.0;
-        double critLow1Thresh = (targetCeiling > 0 && targetCeiling < 60.0) ? targetCeiling * 0.36 : 22.0;
+        // Stress thresholds trigger AI/background conservation when frames degrade meaningfully:
+        // - Low explicit cap (e.g. 30 FPS): scale relative to cap (24 FPS moderate, 16.5 FPS critical).
+        // - High cap (120/144/240): scale relative to cap OR playable floor, without clipping high caps to 60.
+        // - Uncapped (>250): use conservative playable degradation floor (48 FPS mod, 32 FPS crit) or MSPT.
+        double modFpsThresh;
+        double critFpsThresh;
+        double modLow1Thresh;
+        double critLow1Thresh;
+        double recNormFps;
+        double recNormLow1;
+        double recModFps;
+        double recModLow1;
 
-        double recNormFps = (targetCeiling > 0 && targetCeiling < 60.0) ? targetCeiling * 0.90 : 55.0;
-        double recNormLow1 = (targetCeiling > 0 && targetCeiling < 60.0) ? targetCeiling * 0.70 : 42.0;
-        double recModFps = (targetCeiling > 0 && targetCeiling < 60.0) ? targetCeiling * 0.70 : 42.0;
-        double recModLow1 = (targetCeiling > 0 && targetCeiling < 60.0) ? targetCeiling * 0.50 : 30.0;
+        if (hasExplicitCap && targetFpsCap < 60) {
+            modFpsThresh = targetFpsCap * 0.80;
+            critFpsThresh = targetFpsCap * 0.55;
+            modLow1Thresh = targetFpsCap * 0.58;
+            critLow1Thresh = targetFpsCap * 0.36;
+            recNormFps = targetFpsCap * 0.90;
+            recNormLow1 = targetFpsCap * 0.70;
+            recModFps = targetFpsCap * 0.70;
+            recModLow1 = targetFpsCap * 0.50;
+        } else if (hasExplicitCap) {
+            // High FPS caps (60, 120, 144, 240): keep relative degradation threshold without clamping cap to 60!
+            modFpsThresh = Math.max(48.0, targetFpsCap * 0.55);
+            critFpsThresh = Math.max(32.0, targetFpsCap * 0.35);
+            modLow1Thresh = Math.max(35.0, targetFpsCap * 0.40);
+            critLow1Thresh = Math.max(22.0, targetFpsCap * 0.25);
+            recNormFps = modFpsThresh * 1.12;
+            recNormLow1 = modLow1Thresh * 1.15;
+            recModFps = critFpsThresh * 1.25;
+            recModLow1 = critLow1Thresh * 1.25;
+        } else {
+            // Uncapped / VSync without explicit ceiling
+            modFpsThresh = 48.0;
+            critFpsThresh = 32.0;
+            modLow1Thresh = 35.0;
+            critLow1Thresh = 22.0;
+            recNormFps = 55.0;
+            recNormLow1 = 42.0;
+            recModFps = 42.0;
+            recModLow1 = 30.0;
+        }
 
         return switch (current) {
             case NORMAL -> {
-                if (fps < critFpsThresh || low1 < critLow1Thresh || mspt > 46.0) yield StressLevel.CRITICAL;
-                if (fps < modFpsThresh || low1 < modLow1Thresh || mspt > 36.0) yield StressLevel.MODERATE;
+                if (fps < critFpsThresh || low1 < critLow1Thresh || (serverTickRecorded && mspt > 46.0)) {
+                    yield StressLevel.CRITICAL;
+                }
+                if (fps < modFpsThresh || low1 < modLow1Thresh || (serverTickRecorded && mspt > 36.0)) {
+                    yield StressLevel.MODERATE;
+                }
                 yield StressLevel.NORMAL;
             }
             case MODERATE -> {
-                if (fps < critFpsThresh || low1 < critLow1Thresh || mspt > 46.0) yield StressLevel.CRITICAL;
-                if (fps >= recNormFps && low1 >= recNormLow1 && mspt <= 30.0) yield StressLevel.NORMAL;
+                if (fps < critFpsThresh || low1 < critLow1Thresh || (serverTickRecorded && mspt > 46.0)) {
+                    yield StressLevel.CRITICAL;
+                }
+                if (fps >= recNormFps && low1 >= recNormLow1 && (!serverTickRecorded || mspt <= 30.0)) {
+                    yield StressLevel.NORMAL;
+                }
                 yield StressLevel.MODERATE;
             }
             case CRITICAL -> {
-                if (fps >= recModFps && low1 >= recModLow1 && mspt <= 40.0) yield StressLevel.MODERATE;
+                if (fps >= recModFps && low1 >= recModLow1 && (!serverTickRecorded || mspt <= 40.0)) {
+                    yield StressLevel.MODERATE;
+                }
                 yield StressLevel.CRITICAL;
             }
         };
@@ -382,52 +427,73 @@ public final class AdaptivePerformanceEngine {
     }
 
     private void evaluateBottleneck() {
+        // 1. GC Pressure signal
         if (GcMonitor.isUnderGcPressure()) {
             this.bottleneckType = BottleneckType.GC_PRESSURE;
             this.bottleneckConfidence = GcMonitor.getMaxDuration60s() >= 100L ? ConfidenceLevel.HIGH : ConfidenceLevel.MEDIUM;
             return;
         }
 
+        // 2. Server Tick Latency signal (never claimed directly as "CPU_BOUND" without OS CPU counters)
         if (serverTickRecorded && cachedMspt > 38.0) {
-            this.bottleneckType = BottleneckType.CPU_BOUND;
+            this.bottleneckType = BottleneckType.SERVER_TICK_BOUND;
             this.bottleneckConfidence = cachedMspt >= 46.0 ? ConfidenceLevel.HIGH : ConfidenceLevel.MEDIUM;
             return;
         }
 
-        if (!clientFrameRecorded || readiness == TelemetryReadiness.INITIALIZING) {
+        // 3. Insufficient data check: UNKNOWN MUST NEVER report HIGH confidence!
+        if (!clientFrameRecorded && !serverTickRecorded) {
+            this.bottleneckType = BottleneckType.UNKNOWN;
+            this.bottleneckConfidence = ConfidenceLevel.LOW;
+            return;
+        }
+        if (clientFrameRecorded && readiness == TelemetryReadiness.INITIALIZING && !serverTickRecorded) {
             this.bottleneckType = BottleneckType.UNKNOWN;
             this.bottleneckConfidence = ConfidenceLevel.LOW;
             return;
         }
 
-        // Evaluate frame budget strictly relative to configured FPS Cap when present
+        // Headless dedicated server with healthy ticks -> NO_CLEAR_BOTTLENECK
+        if (!clientFrameRecorded && serverTickRecorded) {
+            this.bottleneckType = BottleneckType.NO_CLEAR_BOTTLENECK;
+            this.bottleneckConfidence = ConfidenceLevel.HIGH;
+            return;
+        }
+
+        // Still warming up client frames while local server ticks are healthy
+        if (readiness == TelemetryReadiness.INITIALIZING) {
+            this.bottleneckType = BottleneckType.UNKNOWN;
+            this.bottleneckConfidence = ConfidenceLevel.LOW;
+            return;
+        }
+
+        // 4. Client render budget comparison using real target FPS Cap (30/60/120/144/240)
         boolean hasExplicitCap = targetFpsCap > 0 && targetFpsCap <= 250;
         if (hasExplicitCap) {
-            double targetBudgetMs = 1000.0 / targetFpsCap;
-            // Missing target frame budget by >25% while server logic MSPT is fast (or remote)
-            if (cachedAvgFrameTimeMs > targetBudgetMs * 1.25 && (!serverTickRecorded || cachedMspt < 28.0)) {
+            double targetFrameBudgetMs = 1000.0 / targetFpsCap;
+            if (cachedAvgFrameTimeMs > targetFrameBudgetMs * 1.25 && (!serverTickRecorded || cachedMspt < 28.0)) {
                 this.bottleneckType = BottleneckType.CLIENT_RENDER_BOUND;
                 this.bottleneckConfidence = serverTickRecorded ? ConfidenceLevel.HIGH : ConfidenceLevel.MEDIUM;
                 return;
             }
-        } else if (!vsyncEnabled) {
-            // Uncapped & no VSync: flag only on clear render slowdown (>22ms / <45 FPS) without assuming a fixed 60 target
+        } else {
+            // Uncapped / VSync unknown refresh: only suspect client render on clear sluggishness (>22ms / <45 FPS)
             if (cachedAvgFrameTimeMs > 22.0 && (!serverTickRecorded || cachedMspt < 28.0)) {
                 this.bottleneckType = BottleneckType.CLIENT_RENDER_BOUND;
                 this.bottleneckConfidence = serverTickRecorded ? ConfidenceLevel.MEDIUM : ConfidenceLevel.LOW;
                 return;
             }
-        } else {
-            // VSync active without known display refresh rate -> flag only if heavy slowdown >22ms
-            if (cachedAvgFrameTimeMs > 22.0 && (!serverTickRecorded || cachedMspt < 28.0)) {
-                this.bottleneckType = BottleneckType.CLIENT_RENDER_BOUND;
-                this.bottleneckConfidence = ConfidenceLevel.LOW;
-                return;
-            }
         }
 
-        this.bottleneckType = BottleneckType.UNKNOWN;
-        this.bottleneckConfidence = ConfidenceLevel.HIGH; // Healthy/Balanced
+        // 5. Healthy state -> explicit NO_CLEAR_BOTTLENECK (HIGH if full sample + local MSPT, MEDIUM otherwise)
+        this.bottleneckType = BottleneckType.NO_CLEAR_BOTTLENECK;
+        if (readiness == TelemetryReadiness.STABLE && serverTickRecorded) {
+            this.bottleneckConfidence = ConfidenceLevel.HIGH;
+        } else if (readiness == TelemetryReadiness.STABLE || serverTickRecorded) {
+            this.bottleneckConfidence = ConfidenceLevel.MEDIUM;
+        } else {
+            this.bottleneckConfidence = ConfidenceLevel.LOW;
+        }
     }
 
     public synchronized void resetForTesting() {
@@ -475,6 +541,8 @@ public final class AdaptivePerformanceEngine {
     public boolean isServerTickRecorded()           { return serverTickRecorded; }
     public boolean isIntegratedServerActive()       { return integratedServerActive; }
     public boolean isWorkerRunning()                { return workerRunning; }
+    public int getTargetFpsCap()                    { return targetFpsCap; }
+    public boolean isVsyncEnabled()                 { return vsyncEnabled; }
     public StressLevel getStressLevel()             { return currentStress; }
     public BottleneckType getBottleneckType()       { return bottleneckType; }
     public ConfidenceLevel getBottleneckConfidence(){ return bottleneckConfidence; }

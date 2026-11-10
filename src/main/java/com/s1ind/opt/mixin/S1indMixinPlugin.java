@@ -67,10 +67,10 @@ public class S1indMixinPlugin implements IMixinConfigPlugin {
             }
         }
 
-        // Mob AI throttling skipped if disabled by config or COMPATIBILITY profile
-        if (mixinClassName.endsWith(".MobEntityMixin")) {
+        // Mob AI throttling and its spatial hook skipped cleanly if disabled
+        if (mixinClassName.endsWith(".MobEntityMixin") || mixinClassName.endsWith(".EntitySpatialHookMixin")) {
             if (!config.throttleDistantPassiveMobAi()) {
-                LOG.info("[S1ind] Skipping MobEntityMixin via profile/config.");
+                LOG.info("[S1ind] Skipping {} via profile/config.", mixinClassName);
                 return false;
             }
         }

@@ -8,6 +8,7 @@
     "common.UtilMixin",
     "common.LightingProviderMixin",
     "common.MobEntityMixin",
+    "common.EntitySpatialHookMixin",
     "common.MinecraftServerMixin"
   ],
   "client": [

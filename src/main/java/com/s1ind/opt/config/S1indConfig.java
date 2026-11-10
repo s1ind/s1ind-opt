@@ -5,6 +5,8 @@ import com.google.gson.GsonBuilder;
 import com.google.gson.JsonParseException;
 import com.s1ind.opt.S1indOptMod;
 import com.s1ind.opt.engine.AdaptiveTaskScheduler;
+import com.s1ind.opt.engine.AdaptiveTaskScheduler.SubmissionResult;
+import com.s1ind.opt.engine.AdaptiveTaskScheduler.SubmissionStatus;
 import com.s1ind.opt.engine.AdaptiveTaskScheduler.TaskPriority;
 import net.fabricmc.loader.api.FabricLoader;
 
@@ -13,69 +15,73 @@ import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.util.concurrent.CompletableFuture;
 
 /**
- * Configuration manager for S1ind Optimizer v3.2.1.
+ * Configuration manager for S1ind Optimizer v3.2.2.
  *
  * Reliability guarantees:
- * - Corrupt, empty, or malformed JSON never crashes startup; backs up corrupt file and recovers safely.
- * - Unknown enum values fall back gracefully without discarding other valid user settings.
- * - Strict bounds clamping on all numeric fields.
- * - Enforces profile ceilings (e.g., PERFORMANCE <=4 background workers) over manual overrides.
- * - Atomic save semantics and async disk writes so Render Thread avoids I/O blocking.
+ * - Immutable ConfigSnapshot captured synchronously before asynchronous submission.
+ * - Serialized atomic file writes using unique per-operation temp files (zero .tmp collision).
+ * - Safe fallback to StandardCopyOption.REPLACE_EXISTING if ATOMIC_MOVE is unsupported.
+ * - Explicit SaveStatus reported asynchronously via CompletableFuture (detects scheduler rejection/errors).
  */
 public class S1indConfig {
 
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
+    private static final Object FILE_WRITE_LOCK = new Object();
+
+    public enum SaveStatus {
+        SAVED,
+        REJECTED_BY_SCHEDULER,
+        WRITE_FAILED
+    }
+
+    /** Immutable configuration snapshot guaranteed safe from post-submit mutations. */
+    public record ConfigSnapshot(
+        PerformanceProfile profile,
+        boolean enableAdaptiveEngine,
+        boolean enableF3Telemetry,
+        boolean boostRenderThreadPriority,
+        boolean lowerBackgroundThreadPriority,
+        int backgroundThreadCount,
+        boolean throttleDistantPassiveMobAi,
+        boolean protectVillagerAi,
+        boolean protectModdedEntities,
+        double passiveMobDistanceThreshold,
+        boolean fastLightUpdates,
+        boolean autoMemoryClean,
+        int memoryCheckIntervalSeconds,
+        int memoryPressureThresholdPercent
+    ) {}
 
     // ── Profile ──────────────────────────────────────────────────
     private PerformanceProfile profile = PerformanceProfile.BALANCED;
 
     // ── Adaptive Performance Engine (APE) ─────────────────────────
-    /** Enables adaptive load shedding based on frame / MSPT stress. Telemetry runs regardless. */
     private boolean enableAdaptiveEngine = true;
-
-    /** Shows live metrics (1% Low, 0.1% Low, MSPT, GC) on F3 debug screen. */
     private boolean enableF3Telemetry = true;
 
     // ── Thread & Scheduling Settings ─────────────────────────────
-    /** Requests OS scheduler bias for Render Thread via Thread.MAX_PRIORITY (10). */
     private boolean boostRenderThreadPriority = true;
-
-    /** Lowers Minecraft worker threads (ForkJoin & IO) to Thread.NORM_PRIORITY - 1 (4). */
     private boolean lowerBackgroundThreadPriority = true;
-
-    /** Background worker limit (0 = auto-calculate based on profile and JVM logical processors). */
     private int backgroundThreadCount = 0;
 
     // ── Safe AI Scheduler Settings ───────────────────────────────
-    /** Heuristic throttling for distant passive mobs beyond player radius. */
     private boolean throttleDistantPassiveMobAi = true;
-
-    /** Protects villagers and wandering traders from AI throttling. */
     private boolean protectVillagerAi = true;
-
-    /** Protects third-party modded entities from AI throttling. */
     private boolean protectModdedEntities = true;
-
-    /** Distance in blocks beyond which distant passive mobs receive tiered throttling. */
     private double passiveMobDistanceThreshold = 32.0;
 
     // ── Lighting Settings ────────────────────────────────────────
-    /** Early-exit fast-path for LightingProvider when no lighting updates are queued. */
     private boolean fastLightUpdates = true;
 
-    // ── Memory Settings ──────────────────────────────────────────
-    /** Diagnostic-only advisory memory watchdog (explicitly OFF by default). */
+    // ── Memory Diagnostics Settings ──────────────────────────────
     private boolean autoMemoryClean = false;
-
-    /** Interval in seconds between watchdog checks when enabled (10-300s). */
     private int memoryCheckIntervalSeconds = 30;
-
-    /** Trigger advisory GC only when used heap exceeds threshold and free headroom <250MB (70-95%). */
     private int memoryPressureThresholdPercent = 88;
 
-    // ── Accessors ────────────────────────────────────────────────
+    // ── Accessors & Mutators ─────────────────────────────────────
 
     public PerformanceProfile profile()                  { return profile != null ? profile : PerformanceProfile.BALANCED; }
     public boolean enableAdaptiveEngine()               { return profile() != PerformanceProfile.COMPATIBILITY && enableAdaptiveEngine; }
@@ -89,8 +95,12 @@ public class S1indConfig {
     public boolean autoMemoryClean()                    { return autoMemoryClean; }
     public int     memoryCheckIntervalSeconds()         { return Math.max(10, Math.min(300, memoryCheckIntervalSeconds)); }
     public int     memoryPressureThresholdPercent()     { return Math.min(95, Math.max(70, memoryPressureThresholdPercent)); }
+    public int     rawBackgroundThreadCountSetting()    { return backgroundThreadCount; }
 
-    public int rawBackgroundThreadCountSetting()        { return backgroundThreadCount; }
+    public void setProfile(PerformanceProfile profile)                 { this.profile = profile; sanitize(); }
+    public void setEnableF3Telemetry(boolean enabled)                  { this.enableF3Telemetry = enabled; }
+    public void setBackgroundThreadCount(int count)                    { this.backgroundThreadCount = count; sanitize(); }
+    public void setPassiveMobDistanceThreshold(double threshold)       { this.passiveMobDistanceThreshold = threshold; sanitize(); }
 
     public double passiveMobDistanceThreshold() {
         double configured = sanitizeThreshold(passiveMobDistanceThreshold);
@@ -100,20 +110,10 @@ public class S1indConfig {
         return configured;
     }
 
-    /**
-     * Computes background worker count from logical processors exposed to JVM
-     * (Runtime.getRuntime().availableProcessors()).
-     *
-     * Rules:
-     * - COMPATIBILITY: returns 0 (does not override Vanilla thread count).
-     * - PERFORMANCE: hard cap of 4 workers enforced on BOTH auto and manual configurations.
-     * - BALANCED: dual-core JVM -> 1 worker; 3-4 -> n-1; 5+ -> min(n-2, 8).
-     */
     public int backgroundThreadCount() {
         return computeBackgroundThreadCount(Runtime.getRuntime().availableProcessors());
     }
 
-    /** Testable pure method taking logical processor count. */
     public int computeBackgroundThreadCount(int logicalProcessors) {
         int procs = Math.max(1, logicalProcessors);
         if (profile() == PerformanceProfile.COMPATIBILITY) {
@@ -142,9 +142,29 @@ public class S1indConfig {
         return Math.max(1, resolved);
     }
 
+    public synchronized ConfigSnapshot createImmutableSnapshot() {
+        sanitize();
+        return new ConfigSnapshot(
+            this.profile(),
+            this.enableAdaptiveEngine,
+            this.enableF3Telemetry,
+            this.boostRenderThreadPriority,
+            this.lowerBackgroundThreadPriority,
+            this.backgroundThreadCount,
+            this.throttleDistantPassiveMobAi,
+            this.protectVillagerAi,
+            this.protectModdedEntities,
+            this.passiveMobDistanceThreshold,
+            this.fastLightUpdates,
+            this.autoMemoryClean,
+            this.memoryCheckIntervalSeconds,
+            this.memoryPressureThresholdPercent
+        );
+    }
+
     // ── Sanitization ─────────────────────────────────────────────
 
-    public void sanitize() {
+    public synchronized void sanitize() {
         if (this.profile == null) {
             this.profile = PerformanceProfile.BALANCED;
         }
@@ -187,7 +207,7 @@ public class S1indConfig {
                 String json = Files.readString(path);
                 S1indConfig cfg = parseJsonSafely(json);
                 if (json == null || json.isBlank() || "null".equals(json.trim())) {
-                    saveAtomically(cfg, path);
+                    saveSnapshotAtomically(cfg.createImmutableSnapshot(), path);
                 }
                 return cfg;
             } catch (IOException | JsonParseException | IllegalStateException e) {
@@ -200,38 +220,73 @@ public class S1indConfig {
             }
         }
         S1indConfig cfg = new S1indConfig();
-        saveAtomically(cfg, path);
+        saveSnapshotAtomically(cfg.createImmutableSnapshot(), path);
         return cfg;
     }
 
-    public void save() {
-        saveAtomically(this, configPath());
+    public SaveStatus save() {
+        return saveSnapshotAtomically(createImmutableSnapshot(), configPath());
     }
 
-    public void saveAsync() {
-        final S1indConfig snapshot = this;
-        final Path path = configPath();
-        AdaptiveTaskScheduler.getInstance().submit(
-            () -> saveAtomically(snapshot, path),
+    public CompletableFuture<SaveStatus> saveAsync() {
+        return saveAsyncToFile(configPath());
+    }
+
+    /**
+     * Captures an immutable ConfigSnapshot synchronously and schedules serialized atomic write.
+     * Never blocks the Render Thread and explicitly informs caller if Scheduler rejected the request.
+     */
+    public CompletableFuture<SaveStatus> saveAsyncToFile(Path path) {
+        final ConfigSnapshot snapshot = createImmutableSnapshot();
+        final CompletableFuture<SaveStatus> future = new CompletableFuture<>();
+
+        SubmissionResult sub = AdaptiveTaskScheduler.getInstance().submit(
+            () -> {
+                SaveStatus result = saveSnapshotAtomically(snapshot, path);
+                future.complete(result);
+            },
             TaskPriority.NORMAL,
             "config-save"
         );
+
+        if (sub.status() == SubmissionStatus.REJECTED) {
+            S1indOptMod.LOG.warn("[S1ind] Async config save rejected by AdaptiveTaskScheduler for path {}", path);
+            future.complete(SaveStatus.REJECTED_BY_SCHEDULER);
+        }
+
+        return future;
     }
 
-    public static void saveAtomically(S1indConfig cfg, Path path) {
-        try {
-            if (path.getParent() != null) {
-                Files.createDirectories(path.getParent());
-            }
-            Path tmp = path.resolveSibling(path.getFileName() + ".tmp");
-            Files.writeString(tmp, GSON.toJson(cfg));
+    public static SaveStatus saveSnapshotAtomically(ConfigSnapshot snapshot, Path path) {
+        synchronized (FILE_WRITE_LOCK) {
+            Path tmp = null;
             try {
-                Files.move(tmp, path, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
-            } catch (AtomicMoveNotSupportedException ignored) {
-                Files.move(tmp, path, StandardCopyOption.REPLACE_EXISTING);
+                Path parent = path.getParent();
+                if (parent != null) {
+                    Files.createDirectories(parent);
+                    tmp = Files.createTempFile(parent, path.getFileName() + ".", ".tmp");
+                } else {
+                    tmp = Files.createTempFile(path.getFileName() + ".", ".tmp");
+                }
+
+                Files.writeString(tmp, GSON.toJson(snapshot));
+                try {
+                    Files.move(tmp, path, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+                } catch (AtomicMoveNotSupportedException ignored) {
+                    Files.move(tmp, path, StandardCopyOption.REPLACE_EXISTING);
+                }
+                return SaveStatus.SAVED;
+            } catch (IOException e) {
+                S1indOptMod.LOG.error("[S1ind] Failed saving config atomically to {}", path, e);
+                if (tmp != null) {
+                    try {
+                        Files.deleteIfExists(tmp);
+                    } catch (IOException cleanupErr) {
+                        S1indOptMod.LOG.warn("[S1ind] Failed removing stale temp config file {}", tmp, cleanupErr);
+                    }
+                }
+                return SaveStatus.WRITE_FAILED;
             }
-        } catch (IOException e) {
-            S1indOptMod.LOG.error("[S1ind] Failed to save config atomically to {}", path, e);
         }
     }
 

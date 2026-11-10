@@ -7,6 +7,7 @@ import com.s1ind.opt.engine.MobAiPolicy;
 import com.s1ind.opt.engine.PlayerSpatialIndex;
 import com.s1ind.opt.engine.StressLevel;
 import net.minecraft.entity.EntityType;
+import net.minecraft.entity.EquipmentSlot;
 import net.minecraft.entity.LivingEntity;
 import net.minecraft.entity.mob.MobEntity;
 import net.minecraft.entity.passive.AnimalEntity;
@@ -29,8 +30,8 @@ import java.util.List;
 /**
  * Adaptive, heuristic-guarded AI throttling strictly for vanilla passive entities.
  *
- * Delegates policy evaluation to MobAiPolicy and spatial acceleration (when >8 players)
- * to PlayerSpatialIndex, preserving immediate 0-tick response when approaching <=16 blocks.
+ * Uses EquipmentSlot.SADDLE for riderless/ridden saddle protection (Pig, Strider, Horse, etc.)
+ * verified against Yarn 1.21.11 LivingEntity API.
  */
 @Mixin(MobEntity.class)
 public abstract class MobEntityMixin extends LivingEntity {
@@ -73,9 +74,11 @@ public abstract class MobEntityMixin extends LivingEntity {
         }
 
         MobEntity self = (MobEntity) (Object) this;
+        boolean hasSaddle = this.hasStackEquipped(EquipmentSlot.SADDLE);
         boolean protectedNow = MobAiPolicy.hasDynamicProtection(
             this.hasCustomName(),
             self.isLeashed(),
+            hasSaddle,
             this.hasPassengers(),
             this.hasVehicle(),
             (Object) this instanceof TameableEntity tameable && tameable.isTamed(),
@@ -112,7 +115,7 @@ public abstract class MobEntityMixin extends LivingEntity {
             return Double.MAX_VALUE;
         }
 
-        // Fast zero-allocation direct path for singleplayer & small servers
+        // Fast zero-allocation direct loop for singleplayer & small servers
         if (playerCount <= PlayerSpatialIndex.DIRECT_SCAN_THRESHOLD) {
             double minDistSq = Double.MAX_VALUE;
             for (int i = 0; i < playerCount; i++) {
@@ -130,7 +133,7 @@ public abstract class MobEntityMixin extends LivingEntity {
             return minDistSq;
         }
 
-        // Spatial chunk-bucket path for high-population multiplayer servers (>8 players)
+        // Spatial chunk-bucket index updated live via EntitySpatialHookMixin
         PlayerSpatialIndex spatial = PlayerSpatialIndex.forCurrentThread();
         long worldTime = world.getTime();
         if (spatial.needsRebuild(world, worldTime)) {
@@ -138,11 +141,11 @@ public abstract class MobEntityMixin extends LivingEntity {
             for (int i = 0; i < playerCount; i++) {
                 PlayerEntity p = players.get(i);
                 if (!p.isSpectator()) {
-                    spatial.addPlayer(p.getX(), p.getY(), p.getZ());
+                    spatial.addPlayer(p.getId(), p.getX(), p.getY(), p.getZ());
                 }
             }
         }
 
-        return spatial.findNearestDistanceSq(this.getX(), this.getY(), this.getZ(), searchRadiusBlocks);
+        return spatial.findNearestDistanceSq(world, this.getX(), this.getY(), this.getZ(), searchRadiusBlocks);
     }
 }

@@ -4,6 +4,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import javax.management.MBeanNotificationInfo;
 import javax.management.NotificationFilter;
 import javax.management.NotificationListener;
 import javax.management.ObjectName;
@@ -18,7 +19,7 @@ class GcMonitorTest {
 
     private static class FakeGcBean implements GarbageCollectorMXBean, javax.management.NotificationEmitter {
         private final String name;
-        private final boolean failOnRegister;
+        boolean failOnRegister;
         final List<NotificationListener> listeners = new ArrayList<>();
 
         FakeGcBean(String name, boolean failOnRegister) {
@@ -27,12 +28,12 @@ class GcMonitorTest {
         }
 
         @Override public void addNotificationListener(NotificationListener l, NotificationFilter f, Object h) {
-            if (failOnRegister) throw new IllegalStateException("Mock JMX failure");
+            if (failOnRegister) throw new IllegalStateException("Mock transient JMX error");
             listeners.add(l);
         }
         @Override public void removeNotificationListener(NotificationListener l) { listeners.remove(l); }
         @Override public void removeNotificationListener(NotificationListener l, NotificationFilter f, Object h) { listeners.remove(l); }
-        @Override public javax.management.MBeanNotificationInfo[] getNotificationInfo() { return new javax.management.MBeanNotificationInfo[0]; }
+        @Override public MBeanNotificationInfo[] getNotificationInfo() { return new MBeanNotificationInfo[0]; }
         @Override public long getCollectionCount() { return 0; }
         @Override public long getCollectionTime() { return 0; }
         @Override public String getName() { return name; }
@@ -52,37 +53,40 @@ class GcMonitorTest {
     }
 
     @Test
-    void testMultiBeanAndIdempotentAndPartialFailureRegistrationAndUnregister() {
-        FakeGcBean failingBean = new FakeGcBean("FailingGC", true);
-        FakeGcBean goodBean1 = new FakeGcBean("G1 Young Generation", false);
-        FakeGcBean goodBean2 = new FakeGcBean("G1 Old Generation", false);
+    void testPartialRegistrationRetriesOnlyFailedBeansWithoutDuplicatingHealthyOnes() {
+        FakeGcBean flakyBean = new FakeGcBean("FlakyOldGen", true);
+        FakeGcBean healthyBean = new FakeGcBean("G1 Young", false);
 
-        GcMonitor.registerBeans(List.of(failingBean, goodBean1, goodBean2));
-
+        // Pass 1: flakyBean fails, healthyBean succeeds
+        GcMonitor.registerBeans(List.of(flakyBean, healthyBean));
         assertTrue(GcMonitor.isRegistered());
-        assertEquals(2, GcMonitor.getAttachedListenerCount(), "Must attach healthy beans even if one fails");
-        assertEquals(1, goodBean1.listeners.size());
-        assertEquals(1, goodBean2.listeners.size());
+        assertFalse(GcMonitor.isFullyRegistered(), "Must report partial state when a bean failed");
+        assertEquals(1, GcMonitor.getAttachedListenerCount());
+        assertEquals(1, healthyBean.listeners.size());
+        assertEquals(0, flakyBean.listeners.size());
 
-        // Repeated registration MUST be idempotent (no duplicate listeners)
-        GcMonitor.registerBeans(List.of(goodBean1, goodBean2));
+        // Pass 2: flakyBean recovers! Re-calling registerBeans MUST attach flakyBean without duplicating healthyBean!
+        flakyBean.failOnRegister = false;
+        GcMonitor.registerBeans(List.of(flakyBean, healthyBean));
+        assertTrue(GcMonitor.isFullyRegistered());
         assertEquals(2, GcMonitor.getAttachedListenerCount());
-        assertEquals(1, goodBean1.listeners.size());
+        assertEquals(1, healthyBean.listeners.size(), "Already-registered bean MUST NOT get a duplicate listener");
+        assertEquals(1, flakyBean.listeners.size(), "Previously-failed bean MUST be retried and attached");
 
-        // Unregister removes all listeners cleanly
+        // Unregister removes both cleanly
         GcMonitor.unregister();
         assertFalse(GcMonitor.isRegistered());
-        assertEquals(0, GcMonitor.getAttachedListenerCount());
-        assertEquals(0, goodBean1.listeners.size());
-        assertEquals(0, goodBean2.listeners.size());
+        assertFalse(GcMonitor.isFullyRegistered());
+        assertEquals(0, healthyBean.listeners.size());
+        assertEquals(0, flakyBean.listeners.size());
     }
 
     @Test
     void testMonotonicWindowShorterCycleAndExpiry() {
-        AtomicLong clock = new AtomicLong(100_000_000_000L); // t = 100s
+        AtomicLong clock = new AtomicLong(100_000_000_000L);
         GcMonitor.setClockForTesting(clock::get);
 
-        // Long 120ms GC at t=100s
+        // Long 120ms GC
         GcMonitor.recordEvent(120L, "G1 Young", "Allocation Failure");
         assertEquals(120L, GcMonitor.getLastCycleDurationMs());
         assertEquals(120L, GcMonitor.getMaxDuration60s());
@@ -90,7 +94,7 @@ class GcMonitorTest {
         assertEquals(1, GcMonitor.getGcCyclesPerMinute());
         assertTrue(GcMonitor.isUnderGcPressure());
 
-        // Advance +20s -> Shorter 35ms GC must still update last timestamp and rolling totals!
+        // +20s: Shorter 35ms GC must update last event timestamp & stats
         clock.addAndGet(20_000_000_000L);
         long tShort = clock.get();
         GcMonitor.recordEvent(35L, "G1 Young", "Allocation Failure");
@@ -100,7 +104,7 @@ class GcMonitorTest {
         assertEquals(155L, GcMonitor.getTotalDuration60s());
         assertEquals(2, GcMonitor.getGcCyclesPerMinute());
 
-        // Advance past 60s window for the 120ms event (t = 165s) -> only 35ms remains in 60s window!
+        // +65s from start: 120ms event expires out of 60s window
         clock.set(165_000_000_000L);
         GcMonitor.refreshWindow();
         assertEquals(35L, GcMonitor.getMaxDuration60s());

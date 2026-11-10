@@ -3,35 +3,38 @@ package com.s1ind.opt.engine;
 import com.s1ind.opt.S1indOptMod;
 import com.sun.management.GarbageCollectionNotificationInfo;
 
+import javax.management.MBeanNotificationInfo;
 import javax.management.NotificationEmitter;
 import javax.management.NotificationListener;
 import javax.management.openmbean.CompositeData;
 import java.lang.management.GarbageCollectorMXBean;
 import java.lang.management.ManagementFactory;
 import java.util.ArrayDeque;
-import java.util.ArrayList;
 import java.util.Deque;
+import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.function.LongSupplier;
 
 /**
  * Event-driven Garbage Collector telemetry via JMX NotificationEmitter.
  *
- * - Idempotent, per-MXBean resilient listener registration & clean unregistration.
+ * - Per-MXBean independent registration state: retries failed MXBeans on subsequent
+ *   calls without ever duplicating listeners on already-registered MXBeans.
+ * - Cleanly unregisters all attached listeners upon shutdown.
  * - Maintains a 60-second monotonic history (System.nanoTime()) capturing every GC cycle.
- * - Strictly separates GC Cycle Duration (JMX GcInfo.getDuration()) from true STW Pause
- *   (which is honestly reported as N/A where collectors mix concurrent and stop-the-world work).
+ * - Strictly separates GC Cycle Duration (JMX GcInfo.getDuration()) from STW Pause (N/A).
  */
 public final class GcMonitor {
 
     private record GcEvent(long timestampNano, long durationMs, String gcName, String cause) {}
     private record AttachedListener(NotificationEmitter emitter, NotificationListener listener) {}
 
-    public static final long WINDOW_NANOS = 60_000_000_000L; // 60 seconds
-    private static final long RECENT_PRESSURE_NANOS = 15_000_000_000L; // 15 seconds
+    public static final long WINDOW_NANOS = 60_000_000_000L;
+    private static final long RECENT_PRESSURE_NANOS = 15_000_000_000L;
 
     private static final Deque<GcEvent> history = new ArrayDeque<>();
-    private static final List<AttachedListener> attachedListeners = new ArrayList<>();
+    private static final Map<GarbageCollectorMXBean, AttachedListener> attachedByBean = new IdentityHashMap<>();
 
     private static LongSupplier nanoClock = System::nanoTime;
 
@@ -43,7 +46,7 @@ public final class GcMonitor {
     private static volatile int gcCycles60s = 0;
     private static volatile long totalEventsLifetime = 0;
     private static volatile long lastHeavyEventNano = 0;
-    private static volatile boolean registered = false;
+    private static volatile boolean fullyRegistered = false;
 
     private GcMonitor() {}
 
@@ -52,59 +55,67 @@ public final class GcMonitor {
     }
 
     /**
-     * Registers JMX listeners independently per GC MXBean.
-     * Safe for repeated calls and resilient to partial bean failures.
+     * Registers JMX listeners per GC MXBean. Retries previously failed MXBeans
+     * without duplicating listeners on beans already registered.
      */
     public static synchronized void registerBeans(List<GarbageCollectorMXBean> beans) {
-        if (registered || beans == null) {
+        if (beans == null || beans.isEmpty()) {
             return;
         }
 
-        int attachedCount = 0;
+        boolean allAttached = true;
         for (GarbageCollectorMXBean bean : beans) {
-            if (bean instanceof NotificationEmitter emitter) {
-                NotificationListener listener = (notification, handback) -> {
-                    if (!GarbageCollectionNotificationInfo.GARBAGE_COLLECTION_NOTIFICATION.equals(notification.getType())) {
-                        return;
-                    }
-                    try {
-                        CompositeData cd = (CompositeData) notification.getUserData();
-                        GarbageCollectionNotificationInfo info = GarbageCollectionNotificationInfo.from(cd);
-                        long durationMs = info.getGcInfo().getDuration();
-                        String cause = info.getGcCause() != null ? info.getGcCause() : "unknown";
-                        String name = info.getGcName() != null ? info.getGcName() : "unknown";
+            if (bean == null || attachedByBean.containsKey(bean)) {
+                continue;
+            }
+            if (!(bean instanceof NotificationEmitter emitter)) {
+                // Collector does not emit JMX notifications (safe skip)
+                continue;
+            }
+            MBeanNotificationInfo[] info = emitter.getNotificationInfo();
+            if (info == null) {
+                continue;
+            }
 
-                        recordEvent(durationMs, name, cause);
-                    } catch (Exception e) {
-                        S1indOptMod.LOG.warn("[S1ind] Failed to process JMX GC notification", e);
-                    }
-                };
-
-                try {
-                    emitter.addNotificationListener(listener, null, null);
-                    attachedListeners.add(new AttachedListener(emitter, listener));
-                    attachedCount++;
-                } catch (Exception e) {
-                    S1indOptMod.LOG.warn("[S1ind] Failed to attach GC listener for MXBean '{}'", bean.getName(), e);
+            NotificationListener listener = (notification, handback) -> {
+                if (!GarbageCollectionNotificationInfo.GARBAGE_COLLECTION_NOTIFICATION.equals(notification.getType())) {
+                    return;
                 }
+                try {
+                    CompositeData cd = (CompositeData) notification.getUserData();
+                    GarbageCollectionNotificationInfo gcInfo = GarbageCollectionNotificationInfo.from(cd);
+                    long durationMs = gcInfo.getGcInfo().getDuration();
+                    String cause = gcInfo.getGcCause() != null ? gcInfo.getGcCause() : "unknown";
+                    String name = gcInfo.getGcName() != null ? gcInfo.getGcName() : "unknown";
+
+                    recordEvent(durationMs, name, cause);
+                } catch (Exception e) {
+                    S1indOptMod.LOG.warn("[S1ind] Failed parsing JMX GC notification for '{}'", bean.getName(), e);
+                }
+            };
+
+            try {
+                emitter.addNotificationListener(listener, null, null);
+                attachedByBean.put(bean, new AttachedListener(emitter, listener));
+            } catch (Exception e) {
+                allAttached = false;
+                S1indOptMod.LOG.warn("[S1ind] Partial JMX registration failure for MXBean '{}'; will retry later", bean.getName(), e);
             }
         }
 
-        if (attachedCount > 0) {
-            registered = true;
-        }
+        fullyRegistered = allAttached && !attachedByBean.isEmpty();
     }
 
     public static synchronized void unregister() {
-        for (AttachedListener attached : attachedListeners) {
+        for (AttachedListener attached : attachedByBean.values()) {
             try {
                 attached.emitter().removeNotificationListener(attached.listener());
             } catch (Exception e) {
-                S1indOptMod.LOG.warn("[S1ind] Failed cleanly removing JMX GC listener", e);
+                S1indOptMod.LOG.warn("[S1ind] Error detaching JMX GC listener during shutdown", e);
             }
         }
-        attachedListeners.clear();
-        registered = false;
+        attachedByBean.clear();
+        fullyRegistered = false;
     }
 
     public static synchronized void recordEvent(long durationMs, String gcName, String cause) {
@@ -150,13 +161,10 @@ public final class GcMonitor {
     public static int  getGcCyclesPerMinute()      { return gcCycles60s; }
     public static long getTotalEventsLifetime()    { return totalEventsLifetime; }
     public static String getLastGcCause()          { return lastGcCause; }
-    public static boolean isRegistered()           { return registered; }
-    public static int getAttachedListenerCount()   { return attachedListeners.size(); }
+    public static boolean isFullyRegistered()      { return fullyRegistered; }
+    public static boolean isRegistered()           { return !attachedByBean.isEmpty(); }
+    public static int getAttachedListenerCount()   { return attachedByBean.size(); }
 
-    /**
-     * JMX GcInfo.getDuration() measures total collector cycle duration rather than
-     * strict mutator Stop-The-World pause time on modern concurrent collectors.
-     */
     public static String getStwPauseDisplay() {
         return "N/A";
     }

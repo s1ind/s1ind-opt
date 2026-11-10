@@ -8,22 +8,27 @@ import com.s1ind.opt.engine.AdaptiveTaskScheduler.TaskPriority;
 import java.util.Locale;
 
 /**
- * Low-overhead heap pressure watchdog.
+ * Non-intrusive Heap Pressure & Allocation Rate Diagnostics Watchdog.
  *
- * Explicitly disabled by default. When enabled for low-RAM setups, checks heap utilization
- * via AdaptiveTaskScheduler at LOW priority without spamming System.gc().
+ * Disabled by default unless explicitly enabled in config.
+ * Never calls System.gc() automatically or claims VRAM/texture management:
+ * monitors JVM heap saturation and logs advisory memory warnings when critical.
  */
 public final class MemoryCleaner {
 
     private static volatile boolean running = false;
+    private static volatile double lastAllocationRateMbPerSec = 0.0;
+    private static volatile double lastHeapUsagePercent = 0.0;
     private static Thread watchdogThread = null;
+    private static long lastSampleUsedBytes = -1L;
+    private static long lastSampleNano = 0L;
 
     private MemoryCleaner() {}
 
     public static synchronized void start() {
         S1indConfig config = S1indOptMod.config();
         if (config == null || !config.autoMemoryClean()) {
-            S1indOptMod.LOG.info("[S1ind] Diagnostic advisory Memory Watchdog is disabled (default).");
+            S1indOptMod.LOG.info("[S1ind] Diagnostic Memory Monitor is disabled (default).");
             return;
         }
 
@@ -32,12 +37,16 @@ public final class MemoryCleaner {
         }
         running = true;
 
-        watchdogThread = new Thread(MemoryCleaner::runLoop, "S1ind-Memory-Watchdog");
+        Runtime rt = Runtime.getRuntime();
+        lastSampleUsedBytes = rt.totalMemory() - rt.freeMemory();
+        lastSampleNano = System.nanoTime();
+
+        watchdogThread = new Thread(MemoryCleaner::runLoop, "S1ind-Memory-Diagnostics");
         watchdogThread.setDaemon(true);
         watchdogThread.setPriority(Thread.MIN_PRIORITY);
         watchdogThread.start();
 
-        S1indOptMod.LOG.info("[S1ind] Diagnostic Memory Watchdog active (interval={}s, threshold={}%).",
+        S1indOptMod.LOG.info("[S1ind] Diagnostic Memory Monitor active (interval={}s, warnThreshold={}%).",
             config.memoryCheckIntervalSeconds(),
             config.memoryPressureThresholdPercent()
         );
@@ -45,14 +54,17 @@ public final class MemoryCleaner {
 
     public static synchronized void stop() {
         running = false;
-        if (watchdogThread != null) {
-            watchdogThread.interrupt();
+        Thread t = watchdogThread;
+        if (t != null) {
+            t.interrupt();
             try {
-                watchdogThread.join(1000L);
+                t.join(1000L);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
-            watchdogThread = null;
+            if (!t.isAlive()) {
+                watchdogThread = null;
+            }
         }
     }
 
@@ -65,19 +77,23 @@ public final class MemoryCleaner {
                 Thread.sleep(intervalSec * 1000L);
 
                 if (running) {
-                    AdaptiveTaskScheduler.getInstance().submit(MemoryCleaner::checkAndClean, TaskPriority.LOW, "memory-check");
+                    AdaptiveTaskScheduler.getInstance().submitCoalescing(
+                        MemoryCleaner::sampleHeapDiagnostics,
+                        TaskPriority.LOW,
+                        "memory-diagnostics"
+                    );
                 }
             } catch (InterruptedException e) {
                 if (!running) break;
                 Thread.currentThread().interrupt();
                 break;
             } catch (Exception e) {
-                S1indOptMod.LOG.warn("[S1ind] Memory Watchdog encountered an error", e);
+                S1indOptMod.LOG.warn("[S1ind] Memory Diagnostic Watchdog loop encountered an error", e);
             }
         }
     }
 
-    private static void checkAndClean() {
+    private static void sampleHeapDiagnostics() {
         S1indConfig config = S1indOptMod.config();
         if (config == null || !config.autoMemoryClean()) {
             return;
@@ -85,26 +101,39 @@ public final class MemoryCleaner {
 
         Runtime runtime = Runtime.getRuntime();
         long maxMemory = runtime.maxMemory();
-        long allocatedMemory = runtime.totalMemory();
+        long totalMemory = runtime.totalMemory();
         long freeMemory = runtime.freeMemory();
-        long usedMemory = allocatedMemory - freeMemory;
-
+        long usedMemory = totalMemory - freeMemory;
         if (maxMemory <= 0) return;
 
+        long nowNano = System.nanoTime();
+        if (lastSampleUsedBytes >= 0 && nowNano > lastSampleNano) {
+            long deltaBytes = usedMemory - lastSampleUsedBytes;
+            double dtSec = (nowNano - lastSampleNano) / 1_000_000_000.0;
+            if (deltaBytes >= 0 && dtSec > 0.0) {
+                lastAllocationRateMbPerSec = (deltaBytes / (1024.0 * 1024.0)) / dtSec;
+            }
+        }
+        lastSampleUsedBytes = usedMemory;
+        lastSampleNano = nowNano;
+
         double usedPercent = ((double) usedMemory / (double) maxMemory) * 100.0;
-        long freeRemainingBytes = maxMemory - usedMemory;
-        long criticalThresholdBytes = 250L * 1024L * 1024L;
+        lastHeapUsagePercent = usedPercent;
 
-        if (usedPercent >= config.memoryPressureThresholdPercent() && freeRemainingBytes < criticalThresholdBytes) {
-            long usedBeforeMb = usedMemory / (1024 * 1024);
-            System.gc();
+        long remainingHeadroomBytes = maxMemory - usedMemory;
+        long criticalHeadroomBytes = 250L * 1024L * 1024L;
 
-            long usedAfterMb = (runtime.totalMemory() - runtime.freeMemory()) / (1024 * 1024);
-            long reclaimedMb = Math.max(0, usedBeforeMb - usedAfterMb);
-
+        if (usedPercent >= config.memoryPressureThresholdPercent() && remainingHeadroomBytes < criticalHeadroomBytes) {
             String formattedPct = String.format(Locale.ROOT, "%.1f", usedPercent);
-            S1indOptMod.LOG.info("[S1ind] Advisory GC requested at {}% heap: delta ~{} MB (used: {} MB -> {} MB)",
-                formattedPct, reclaimedMb, usedBeforeMb, usedAfterMb);
+            String formattedRate = String.format(Locale.ROOT, "%.1f", lastAllocationRateMbPerSec);
+            S1indOptMod.LOG.warn(
+                "[S1ind] High Java Heap pressure detected: {}% used ({} MB free headroom remaining, net delta ~{} MB/s). Consider checking mod memory usage or increasing -Xmx.",
+                formattedPct, remainingHeadroomBytes / (1024 * 1024), formattedRate
+            );
         }
     }
+
+    public static double getLastAllocationRateMbPerSec() { return lastAllocationRateMbPerSec; }
+    public static double getLastHeapUsagePercent()       { return lastHeapUsagePercent; }
+    public static boolean isRunning()                    { return running; }
 }
