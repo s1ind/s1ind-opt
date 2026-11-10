@@ -13,7 +13,9 @@ build/
 .project
 .classpath
 
-# OS files
+# OS & Runtime Logs
+logs/
+run/
 Thumbs.db
 Desktop.ini
 .DS_Store
