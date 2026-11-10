@@ -1,5 +1,6 @@
 package com.s1ind.opt.mixin;
 
+import com.s1ind.opt.config.PerformanceProfile;
 import com.s1ind.opt.config.S1indConfig;
 import net.fabricmc.loader.api.FabricLoader;
 import org.objectweb.asm.tree.ClassNode;
@@ -14,29 +15,33 @@ import java.util.Set;
 /**
  * Mixin configuration plugin.
  *
- * Dynamically disables non-telemetry mixins when disabled in config or when
- * conflicting third-party rewrites (e.g. Starlight/Phosphor) are present.
- * Note: MinecraftClientMixin always loads to maintain frame telemetry independent of thread priority config.
+ * Inspects installed optimization mods (Sodium, Iris, ImmediatelyFast, Lithium, EntityCulling, FerriteCore, ModernFix)
+ * and selectively disables conflicting or profile-excluded S1ind mixins without disabling telemetry.
  */
 public class S1indMixinPlugin implements IMixinConfigPlugin {
 
     private static final Logger LOG = LoggerFactory.getLogger("s1ind_opt/compat");
     private S1indConfig config;
-    private boolean starlightOrPhosphorLoaded = false;
+    private boolean customLightModLoaded = false;
 
     @Override
     public void onLoad(String mixinPackage) {
         FabricLoader loader = FabricLoader.getInstance();
         this.config = S1indConfig.load();
-        this.starlightOrPhosphorLoaded = loader.isModLoaded("starlight") || loader.isModLoaded("phosphor");
 
+        this.customLightModLoaded = loader.isModLoaded("starlight") || loader.isModLoaded("phosphor");
         boolean sodium = loader.isModLoaded("sodium") || loader.isModLoaded("embeddium");
+        boolean iris = loader.isModLoaded("iris");
         boolean immediatelyFast = loader.isModLoaded("immediatelyfast");
         boolean lithium = loader.isModLoaded("lithium");
-        boolean iris = loader.isModLoaded("iris");
+        boolean entityCulling = loader.isModLoaded("entityculling");
+        boolean ferriteCore = loader.isModLoaded("ferritecore");
+        boolean modernFix = loader.isModLoaded("modernfix");
 
-        LOG.info("[S1ind] Environment audit: Sodium={}, ImmediatelyFast={}, Lithium={}, Iris={}, Starlight/Phosphor={}",
-            sodium, immediatelyFast, lithium, iris, starlightOrPhosphorLoaded);
+        LOG.info(
+            "[S1ind] Environment audit: Profile={}, Sodium={}, Iris={}, ImmediatelyFast={}, Lithium={}, EntityCulling={}, FerriteCore={}, ModernFix={}, CustomLight={}",
+            config.profile(), sodium, iris, immediatelyFast, lithium, entityCulling, ferriteCore, modernFix, customLightModLoaded
+        );
     }
 
     @Override
@@ -50,24 +55,43 @@ public class S1indMixinPlugin implements IMixinConfigPlugin {
             return true;
         }
 
+        // Lighting fast-path skips if third-party lighting engine is active or profile/config disables it
         if (mixinClassName.endsWith(".LightingProviderMixin")) {
-            if (starlightOrPhosphorLoaded) {
-                LOG.info("[S1ind] Disabling LightingProviderMixin due to Starlight/Phosphor.");
+            if (customLightModLoaded) {
+                LOG.info("[S1ind] Skipping LightingProviderMixin (Starlight/Phosphor detected).");
                 return false;
             }
             if (!config.fastLightUpdates()) {
-                LOG.info("[S1ind] Disabling LightingProviderMixin via config/profile.");
+                LOG.info("[S1ind] Skipping LightingProviderMixin via profile/config.");
                 return false;
             }
         }
 
+        // Mob AI throttling skipped if disabled by config or COMPATIBILITY profile
         if (mixinClassName.endsWith(".MobEntityMixin")) {
             if (!config.throttleDistantPassiveMobAi()) {
-                LOG.info("[S1ind] Disabling MobEntityMixin via config/profile.");
+                LOG.info("[S1ind] Skipping MobEntityMixin via profile/config.");
                 return false;
             }
         }
 
+        // Render priority elevation isolated cleanly in ClientPriorityMixin
+        if (mixinClassName.endsWith(".ClientPriorityMixin")) {
+            if (!config.boostRenderThreadPriority()) {
+                LOG.info("[S1ind] Skipping ClientPriorityMixin via profile/config.");
+                return false;
+            }
+        }
+
+        // Thread pool overrides skipped cleanly in COMPATIBILITY profile
+        if (mixinClassName.endsWith(".UtilMixin")) {
+            if (config.profile() == PerformanceProfile.COMPATIBILITY) {
+                LOG.info("[S1ind] Skipping UtilMixin in COMPATIBILITY profile.");
+                return false;
+            }
+        }
+
+        // MinecraftClientMixin, MinecraftServerMixin, DebugHudMixin always load for telemetry/lifecycle
         return true;
     }
 

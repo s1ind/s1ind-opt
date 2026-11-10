@@ -8,12 +8,10 @@ import com.s1ind.opt.engine.AdaptiveTaskScheduler.TaskPriority;
 import java.util.Locale;
 
 /**
- * Low-overhead memory pressure watchdog.
+ * Low-overhead heap pressure watchdog.
  *
- * Disabled by default (recommended only for <=3GB heap environments).
- * Schedules checks via AdaptiveTaskScheduler so routine inspections defer during frame spikes.
- * Note: System.gc() is an advisory request to the JVM; actual reclamation and pause time
- * are governed by the JVM Garbage Collector implementation (G1GC / ZGC).
+ * Explicitly disabled by default. When enabled for low-RAM setups, checks heap utilization
+ * via AdaptiveTaskScheduler at LOW priority without spamming System.gc().
  */
 public final class MemoryCleaner {
 
@@ -25,7 +23,7 @@ public final class MemoryCleaner {
     public static synchronized void start() {
         S1indConfig config = S1indOptMod.config();
         if (config == null || !config.autoMemoryClean()) {
-            S1indOptMod.LOG.info("[S1ind] Memory Watchdog is disabled (default for normal RAM environments).");
+            S1indOptMod.LOG.info("[S1ind] Diagnostic advisory Memory Watchdog is disabled (default).");
             return;
         }
 
@@ -39,7 +37,7 @@ public final class MemoryCleaner {
         watchdogThread.setPriority(Thread.MIN_PRIORITY);
         watchdogThread.start();
 
-        S1indOptMod.LOG.info("[S1ind] Memory Watchdog active (interval: {}s, threshold: {}%).",
+        S1indOptMod.LOG.info("[S1ind] Diagnostic Memory Watchdog active (interval={}s, threshold={}%).",
             config.memoryCheckIntervalSeconds(),
             config.memoryPressureThresholdPercent()
         );
@@ -49,6 +47,11 @@ public final class MemoryCleaner {
         running = false;
         if (watchdogThread != null) {
             watchdogThread.interrupt();
+            try {
+                watchdogThread.join(1000L);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
             watchdogThread = null;
         }
     }
@@ -61,8 +64,11 @@ public final class MemoryCleaner {
                     : 30;
                 Thread.sleep(intervalSec * 1000L);
 
-                AdaptiveTaskScheduler.getInstance().submit(MemoryCleaner::checkAndClean, TaskPriority.LOW);
+                if (running) {
+                    AdaptiveTaskScheduler.getInstance().submit(MemoryCleaner::checkAndClean, TaskPriority.LOW, "memory-check");
+                }
             } catch (InterruptedException e) {
+                if (!running) break;
                 Thread.currentThread().interrupt();
                 break;
             } catch (Exception e) {

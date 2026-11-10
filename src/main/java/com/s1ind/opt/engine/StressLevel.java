@@ -1,17 +1,13 @@
 package com.s1ind.opt.engine;
 
 /**
- * Runtime stress level evaluated by AdaptivePerformanceEngine (APE) with dwell hysteresis.
+ * Runtime stress level evaluated by AdaptivePerformanceEngine (APE) with monotonic hysteresis.
  *
- * Client thresholds (relative to effective FPS target ceiling):
- * - NORMAL: Avg FPS >= 85% of target, 1% Low >= 60% of target, MSPT <= 36ms.
- * - MODERATE: Avg FPS < 80% of target OR 1% Low < 58% of target OR MSPT > 36ms.
- * - CRITICAL: Avg FPS < 55% of target OR 1% Low < 36% of target OR MSPT > 46ms.
- *
- * Dedicated Server mode evaluates solely on tick latency (MSPT):
- * - NORMAL: MSPT <= 36ms
- * - MODERATE: MSPT > 36ms
- * - CRITICAL: MSPT > 46ms
+ * Evaluation modes:
+ * - Dedicated Server (headless, no frames recorded): based strictly on server tick MSPT
+ *   (NORMAL <=36ms, MODERATE >36ms, CRITICAL >46ms).
+ * - Client: combines local MSPT (if integrated server is running) and frame pacing relative
+ *   to configured FPS Cap / VSync without inventing a fixed 60 FPS cap when FPS cap is higher.
  */
 public enum StressLevel {
     NORMAL,

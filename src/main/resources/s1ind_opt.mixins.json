@@ -12,6 +12,7 @@
   ],
   "client": [
     "client.MinecraftClientMixin",
+    "client.ClientPriorityMixin",
     "client.DebugHudMixin"
   ],
   "injectors": {

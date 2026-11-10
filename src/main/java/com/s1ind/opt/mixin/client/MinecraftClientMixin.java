@@ -15,9 +15,9 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 /**
  * Client lifecycle and nanosecond frame timing:
- * - Always measures render() duration in O(1) for AdaptivePerformanceEngine (even in Compatibility profile).
- * - Elevates Render Thread priority to MAX_PRIORITY (10) when configured.
- * - Tracks client FPS cap to prevent false CRITICAL triggers on intentional frame limits.
+ * - Always loads on client (including Compatibility profile) to sustain telemetry.
+ * - Measures render() duration in O(1) with zero Render Thread sorting/allocations.
+ * - Syncs FPS Cap, VSync state, and local server presence to AdaptivePerformanceEngine.
  */
 @Mixin(MinecraftClient.class)
 public abstract class MinecraftClientMixin {
@@ -26,26 +26,20 @@ public abstract class MinecraftClientMixin {
     @Final
     public GameOptions options;
 
+    @Shadow
+    public abstract boolean isIntegratedServerRunning();
+
     @Unique
     private long s1ind$frameStartNano = 0;
 
     @Unique
-    private int s1ind$capSyncCounter = 0;
+    private int s1ind$settingsSyncCounter = 0;
 
     @Inject(method = "run", at = @At("HEAD"))
     private void s1ind$onClientRun(CallbackInfo ci) {
         AdaptivePerformanceEngine.getInstance().startBackgroundWorker();
-
-        if (S1indOptMod.config() != null) {
-            if (S1indOptMod.config().boostRenderThreadPriority()) {
-                Thread current = Thread.currentThread();
-                current.setPriority(Thread.MAX_PRIORITY);
-                S1indOptMod.LOG.info("[S1ind] Render Thread priority set to MAX_PRIORITY (10)");
-            }
-
-            if (S1indOptMod.config().autoMemoryClean()) {
-                MemoryCleaner.start();
-            }
+        if (S1indOptMod.config() != null && S1indOptMod.config().autoMemoryClean()) {
+            MemoryCleaner.start();
         }
     }
 
@@ -61,11 +55,15 @@ public abstract class MinecraftClientMixin {
             AdaptivePerformanceEngine.getInstance().recordFrame(duration);
         }
 
-        if ((++s1ind$capSyncCounter & 127) == 0 && this.options != null) {
+        // Sync client render cap/vsync periodically (approx once every 128 frames)
+        if ((++s1ind$settingsSyncCounter & 127) == 0 && this.options != null) {
             Integer cap = this.options.getMaxFps().getValue();
-            if (cap != null) {
-                AdaptivePerformanceEngine.getInstance().updateClientFpsLimit(cap);
-            }
+            Boolean vsync = this.options.getEnableVsync().getValue();
+            AdaptivePerformanceEngine.getInstance().updateClientRenderSettings(
+                cap != null ? cap : 260,
+                vsync != null && vsync,
+                this.isIntegratedServerRunning()
+            );
         }
     }
 

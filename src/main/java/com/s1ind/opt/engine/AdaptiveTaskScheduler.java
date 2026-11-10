@@ -2,36 +2,50 @@ package com.s1ind.opt.engine;
 
 import com.s1ind.opt.S1indOptMod;
 
-import java.util.Comparator;
-import java.util.concurrent.PriorityBlockingQueue;
+import java.util.ArrayDeque;
+import java.util.Deque;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
- * Stress-aware background task dispatcher coupled to AdaptivePerformanceEngine.
+ * Reactive, lock/condition-driven background task dispatcher coupled to APE.
  *
- * Isolates non-critical background jobs (telemetry maintenance, cache pruning,
- * memory diagnostics) and paces or defers low-priority work when APE detects
- * MODERATE or CRITICAL stress, protecting Vanilla's primary game and render threads.
+ * Design guarantees:
+ * - Zero Thread.sleep() usage: waits cleanly on Condition.awaitNanos(), ensuring
+ *   incoming HIGH tasks wake the worker instantaneously with zero LOW-task blocking.
+ * - Strictly bounded queues per priority tier with overflow rejection counters.
+ * - Starvation protection: tracks enqueue age; aged LOW tasks execute past MAX_LOW_DEFERRAL_NANOS.
+ * - Supports stale-task cancellation via TaskHandle and tags.
  */
 public final class AdaptiveTaskScheduler {
 
     public enum TaskPriority {
-        HIGH(0),     // Always executes promptly
-        NORMAL(1),   // Paced slightly during CRITICAL stress
-        LOW(2);      // Deferred during CRITICAL stress
-
-        final int weight;
-        TaskPriority(int weight) { this.weight = weight; }
+        HIGH,
+        NORMAL,
+        LOW
     }
 
-    private record ScheduledTask(Runnable task, TaskPriority priority, long enqueuedNano)
-        implements Comparable<ScheduledTask> {
-        @Override
-        public int compareTo(ScheduledTask other) {
-            int p = Integer.compare(this.priority.weight, other.priority.weight);
-            return p != 0 ? p : Long.compare(this.enqueuedNano, other.enqueuedNano);
-        }
+    public static final class TaskHandle {
+        private final AtomicBoolean cancelled = new AtomicBoolean(false);
+        public void cancel() { cancelled.set(true); }
+        public boolean isCancelled() { return cancelled.get(); }
     }
+
+    private record QueuedTask(
+        Runnable runnable,
+        TaskPriority priority,
+        String tag,
+        long enqueuedNano,
+        TaskHandle handle
+    ) {}
+
+    public static final int MAX_TIER_QUEUE_SIZE = 128;
+    private static final long LOW_DEFER_CRITICAL_WAIT_NANOS = 250_000_000L;  // 250ms wake interval
+    private static final long MODERATE_LOW_PACING_NANOS = 100_000_000L;      // 100ms pacing under MODERATE
+    private static final long MAX_LOW_STARVATION_NANOS = 4_000_000_000L;     // Promote after 4.0s wait
 
     private static final AdaptiveTaskScheduler INSTANCE = new AdaptiveTaskScheduler();
 
@@ -39,89 +53,258 @@ public final class AdaptiveTaskScheduler {
         return INSTANCE;
     }
 
-    private final PriorityBlockingQueue<ScheduledTask> queue = new PriorityBlockingQueue<>(64, Comparator.naturalOrder());
+    private final ReentrantLock lock = new ReentrantLock();
+    private final Condition workAvailable = lock.newCondition();
+
+    private final Deque<QueuedTask> highQueue = new ArrayDeque<>(MAX_TIER_QUEUE_SIZE);
+    private final Deque<QueuedTask> normalQueue = new ArrayDeque<>(MAX_TIER_QUEUE_SIZE);
+    private final Deque<QueuedTask> lowQueue = new ArrayDeque<>(MAX_TIER_QUEUE_SIZE);
+
     private final AtomicInteger deferredCount = new AtomicInteger(0);
+    private final AtomicInteger droppedCount = new AtomicInteger(0);
+    private final AtomicInteger executedCount = new AtomicInteger(0);
+
     private volatile boolean running = false;
     private Thread workerThread = null;
+    private long nextLowAllowedNano = 0L;
 
     private AdaptiveTaskScheduler() {}
 
     public synchronized void start() {
-        if (running) return;
+        if (running) {
+            return;
+        }
         running = true;
-        workerThread = new Thread(this::runLoop, "S1ind-Adaptive-Dispatcher");
+        workerThread = new Thread(this::dispatchLoop, "S1ind-Adaptive-Scheduler");
         workerThread.setDaemon(true);
-        workerThread.setPriority(Thread.NORM_PRIORITY - 1); // Priority 4
+        workerThread.setPriority(Thread.NORM_PRIORITY - 1);
         workerThread.start();
     }
 
     public synchronized void stop() {
         running = false;
+        lock.lock();
+        try {
+            highQueue.clear();
+            normalQueue.clear();
+            lowQueue.clear();
+            workAvailable.signalAll();
+        } finally {
+            lock.unlock();
+        }
         if (workerThread != null) {
             workerThread.interrupt();
-            workerThread = null;
-        }
-        queue.clear();
-    }
-
-    public void submit(Runnable task, TaskPriority priority) {
-        if (task == null) return;
-        if (!running && !Thread.currentThread().isInterrupted()) {
-            // Allow graceful direct check in tests or pre-start phases
-            queue.offer(new ScheduledTask(task, priority, System.nanoTime()));
-            return;
-        }
-        queue.offer(new ScheduledTask(task, priority, System.nanoTime()));
-    }
-
-    private void runLoop() {
-        while (running) {
             try {
-                ScheduledTask next = queue.take();
-                processSingleTask(next);
+                workerThread.join(1000L);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
-                break;
-            } catch (Exception e) {
-                S1indOptMod.LOG.warn("[S1ind] AdaptiveTaskScheduler caught exception during dispatch", e);
+            }
+            workerThread = null;
+        }
+    }
+
+    public TaskHandle submit(Runnable runnable, TaskPriority priority) {
+        return submit(runnable, priority, "default");
+    }
+
+    public TaskHandle submit(Runnable runnable, TaskPriority priority, String tag) {
+        TaskHandle handle = new TaskHandle();
+        if (runnable == null || priority == null) {
+            handle.cancel();
+            return handle;
+        }
+
+        QueuedTask task = new QueuedTask(
+            runnable,
+            priority,
+            tag != null ? tag : "default",
+            System.nanoTime(),
+            handle
+        );
+
+        lock.lock();
+        try {
+            Deque<QueuedTask> target = queueFor(priority);
+            if (target.size() >= MAX_TIER_QUEUE_SIZE) {
+                if (priority == TaskPriority.HIGH) {
+                    // Evict oldest LOW or NORMAL task to honor HIGH admission if overloaded, else drop oldest
+                    if (!lowQueue.isEmpty()) {
+                        lowQueue.removeFirst().handle().cancel();
+                        droppedCount.incrementAndGet();
+                    } else if (!target.isEmpty()) {
+                        target.removeFirst().handle().cancel();
+                        droppedCount.incrementAndGet();
+                    }
+                } else {
+                    droppedCount.incrementAndGet();
+                    handle.cancel();
+                    return handle;
+                }
+            }
+            target.addLast(task);
+            workAvailable.signalAll();
+        } finally {
+            lock.unlock();
+        }
+        return handle;
+    }
+
+    public void cancelByTag(String tag) {
+        if (tag == null) return;
+        lock.lock();
+        try {
+            cancelInQueue(highQueue, tag);
+            cancelInQueue(normalQueue, tag);
+            cancelInQueue(lowQueue, tag);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private static void cancelInQueue(Deque<QueuedTask> queue, String tag) {
+        for (QueuedTask t : queue) {
+            if (tag.equals(t.tag())) {
+                t.handle().cancel();
+            }
+        }
+    }
+
+    private Deque<QueuedTask> queueFor(TaskPriority priority) {
+        return switch (priority) {
+            case HIGH -> highQueue;
+            case NORMAL -> normalQueue;
+            case LOW -> lowQueue;
+        };
+    }
+
+    private void dispatchLoop() {
+        while (running) {
+            QueuedTask toRun = null;
+            lock.lock();
+            try {
+                while (running) {
+                    toRun = selectNextTaskLocked(System.nanoTime());
+                    if (toRun != null) {
+                        break;
+                    }
+                    // If low queue has deferred tasks during CRITICAL/MODERATE stress, await with wake timeout
+                    if (!lowQueue.isEmpty()) {
+                        workAvailable.await(LOW_DEFER_CRITICAL_WAIT_NANOS, TimeUnit.NANOSECONDS);
+                    } else {
+                        workAvailable.await();
+                    }
+                }
+            } catch (InterruptedException e) {
+                if (!running) break;
+            } finally {
+                lock.unlock();
+            }
+
+            if (toRun != null && !toRun.handle().isCancelled()) {
+                executeSafely(toRun);
             }
         }
     }
 
     /**
-     * Executes one task respecting current APE StressLevel pacing rules.
-     * Package-private helper exposed for deterministic unit testing.
+     * Selects the highest priority eligible task respecting APE StressLevel and starvation bounds.
+     * Package-private for deterministic unit verification.
      */
-    boolean processSingleTask(ScheduledTask next) throws InterruptedException {
-        StressLevel stress = AdaptivePerformanceEngine.getInstance().getStressLevel();
+    QueuedTask selectNextTaskLocked(long nowNano) {
+        // Purge cancelled items from heads
+        purgeCancelled(highQueue);
+        purgeCancelled(normalQueue);
+        purgeCancelled(lowQueue);
 
-        if (next.priority() == TaskPriority.LOW && stress == StressLevel.CRITICAL) {
-            long ageMs = (System.nanoTime() - next.enqueuedNano()) / 1_000_000L;
-            if (ageMs < 5_000L) {
-                // Defer low-priority maintenance while critical stress persists (max 5s deferral)
-                deferredCount.incrementAndGet();
-                queue.offer(next);
-                Thread.sleep(250L);
-                return false;
-            }
-        } else if (stress == StressLevel.MODERATE && next.priority() != TaskPriority.HIGH) {
-            Thread.sleep(25L); // Gentle pacing to yield timeslices to main thread
+        // 1. HIGH always drains first, unconditionally
+        if (!highQueue.isEmpty()) {
+            return highQueue.removeFirst();
         }
 
-        next.task().run();
-        return true;
+        // 2. NORMAL always executes ahead of LOW
+        if (!normalQueue.isEmpty()) {
+            return normalQueue.removeFirst();
+        }
+
+        // 3. LOW executes based on current APE StressLevel + anti-starvation aging
+        if (!lowQueue.isEmpty()) {
+            QueuedTask head = lowQueue.peekFirst();
+            long waitAgeNano = nowNano - head.enqueuedNano();
+            StressLevel stress = AdaptivePerformanceEngine.getInstance().getStressLevel();
+
+            if (stress == StressLevel.NORMAL || waitAgeNano >= MAX_LOW_STARVATION_NANOS) {
+                nextLowAllowedNano = nowNano + MODERATE_LOW_PACING_NANOS;
+                return lowQueue.removeFirst();
+            }
+
+            if (stress == StressLevel.MODERATE) {
+                if (nowNano >= nextLowAllowedNano) {
+                    nextLowAllowedNano = nowNano + MODERATE_LOW_PACING_NANOS;
+                    return lowQueue.removeFirst();
+                } else {
+                    deferredCount.incrementAndGet();
+                    return null;
+                }
+            }
+
+            // CRITICAL stress and within starvation limit -> defer LOW work
+            deferredCount.incrementAndGet();
+            return null;
+        }
+
+        return null;
+    }
+
+    private static void purgeCancelled(Deque<QueuedTask> queue) {
+        while (!queue.isEmpty() && queue.peekFirst().handle().isCancelled()) {
+            queue.removeFirst();
+        }
+    }
+
+    private void executeSafely(QueuedTask task) {
+        try {
+            task.runnable().run();
+            executedCount.incrementAndGet();
+        } catch (Exception e) {
+            S1indOptMod.LOG.warn("[S1ind] Background task '{}' threw exception", task.tag(), e);
+        }
+    }
+
+    /** Package-private test helper to drain one step synchronously without waiting for worker thread. */
+    boolean stepOnceForTesting(long nowNano) {
+        QueuedTask task;
+        lock.lock();
+        try {
+            task = selectNextTaskLocked(nowNano);
+        } finally {
+            lock.unlock();
+        }
+        if (task != null && !task.handle().isCancelled()) {
+            executeSafely(task);
+            return true;
+        }
+        return false;
     }
 
     public int getPendingCount() {
-        return queue.size();
+        lock.lock();
+        try {
+            return highQueue.size() + normalQueue.size() + lowQueue.size();
+        } finally {
+            lock.unlock();
+        }
     }
 
-    public int getDeferredCount() {
-        return deferredCount.get();
-    }
+    public int getDeferredCount() { return deferredCount.get(); }
+    public int getDroppedCount()  { return droppedCount.get(); }
+    public int getExecutedCount() { return executedCount.get(); }
+    public boolean isRunning()    { return running; }
 
     public void resetForTesting() {
-        queue.clear();
+        stop();
         deferredCount.set(0);
+        droppedCount.set(0);
+        executedCount.set(0);
+        nextLowAllowedNano = 0L;
     }
 }

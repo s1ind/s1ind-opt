@@ -20,7 +20,7 @@ public class S1indOptMod implements ModInitializer {
     public void onInitialize() {
         config = S1indConfig.load();
 
-        LOG.info("[S1ind] Initializing S1ind Optimizer v3.2.0 (Adaptive Performance Engine)");
+        LOG.info("[S1ind] Initializing S1ind Optimizer v3.2.1 (Adaptive Performance Engine)");
         LOG.info("[S1ind] Active Profile: {}", config.profile());
         LOG.info("[S1ind] Adaptive Performance Engine: {}", config.enableAdaptiveEngine() ? "ACTIVE" : "MONITOR_ONLY");
         LOG.info("[S1ind] In-game F3 Telemetry: {}", config.enableF3Telemetry() ? "ENABLED" : "DISABLED");
@@ -29,9 +29,9 @@ public class S1indOptMod implements ModInitializer {
             config.lowerBackgroundThreadPriority() ? "NORM-1 (4)" : "VANILLA",
             config.backgroundThreadCount() > 0 ? config.backgroundThreadCount() + " threads" : "VANILLA"
         );
-        LOG.info("[S1ind] Tiered Passive Mob AI Throttling: {}",
+        LOG.info("[S1ind] Passive Mob AI Policy: {}",
             config.throttleDistantPassiveMobAi()
-                ? "ACTIVE (threshold=" + config.passiveMobDistanceThreshold() + "b, villagersProtected=" + config.protectVillagerAi() + ")"
+                ? "ACTIVE (threshold=" + config.passiveMobDistanceThreshold() + "b, villagersProtected=" + config.protectVillagerAi() + ", moddedProtected=" + config.protectModdedEntities() + ")"
                 : "DISABLED"
         );
         LOG.info("[S1ind] Light Fast-Path: {}", config.fastLightUpdates() ? "ENABLED" : "DISABLED");

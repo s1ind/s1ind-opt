@@ -12,11 +12,8 @@ import java.util.concurrent.ForkJoinWorkerThread;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * Worker thread tuning and thread priority balancing.
- *
- * 1. Overrides Util.getAvailableBackgroundThreads() with CPU-aware allocation.
- * 2. Assigns Thread.NORM_PRIORITY - 1 (4) to IO and ForkJoin workers if enabled,
- *    reducing OS scheduling contention against the Render Thread.
+ * Worker thread tuning and priority balancing strictly for Vanilla Minecraft pools.
+ * Does not touch executors or threads created by third-party mods.
  */
 @Mixin(Util.class)
 public abstract class UtilMixin {
@@ -35,9 +32,6 @@ public abstract class UtilMixin {
         }
     }
 
-    /**
-     * Minecraft IO / Download thread factory.
-     */
     @Inject(
         method = "method_27956",
         at = @At("RETURN")
@@ -51,13 +45,14 @@ public abstract class UtilMixin {
     ) {
         Thread thread = cir.getReturnValue();
         if (thread != null && (S1indOptMod.config() == null || S1indOptMod.config().lowerBackgroundThreadPriority())) {
-            thread.setPriority(Thread.NORM_PRIORITY - 1);
+            try {
+                thread.setPriority(Math.max(Thread.MIN_PRIORITY, Thread.NORM_PRIORITY - 1));
+            } catch (SecurityException e) {
+                S1indOptMod.LOG.warn("[S1ind] Unable to set IO thread priority for '{}'", name, e);
+            }
         }
     }
 
-    /**
-     * Minecraft ForkJoinWorkerThread factory.
-     */
     @Inject(
         method = "method_28123",
         at = @At("RETURN")
@@ -70,7 +65,11 @@ public abstract class UtilMixin {
     ) {
         ForkJoinWorkerThread thread = cir.getReturnValue();
         if (thread != null && (S1indOptMod.config() == null || S1indOptMod.config().lowerBackgroundThreadPriority())) {
-            thread.setPriority(Thread.NORM_PRIORITY - 1);
+            try {
+                thread.setPriority(Math.max(Thread.MIN_PRIORITY, Thread.NORM_PRIORITY - 1));
+            } catch (SecurityException e) {
+                S1indOptMod.LOG.warn("[S1ind] Unable to set ForkJoin thread priority for '{}'", name, e);
+            }
         }
     }
 }
