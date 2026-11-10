@@ -7,7 +7,8 @@
   "mixins": [
     "common.UtilMixin",
     "common.LightingProviderMixin",
-    "common.MobEntityMixin"
+    "common.MobEntityMixin",
+    "common.MinecraftServerMixin"
   ],
   "client": [
     "client.MinecraftClientMixin",

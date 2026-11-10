@@ -1,20 +1,15 @@
 package com.s1ind.opt.engine;
 
-import java.lang.management.GarbageCollectorMXBean;
-import java.lang.management.ManagementFactory;
 import java.util.Arrays;
-import java.util.List;
 
 /**
- * Adaptive Performance Engine (APE) - Core controller for S1ind Optimizer.
+ * Adaptive Performance Engine (APE) v3.1.0.
  *
- * Dynamically measures:
- * - Real-time Frame Times, Average FPS, 1% Low FPS, 0.1% Low FPS
- * - Milliseconds Per Tick (MSPT)
- * - GC Pauses (via GarbageCollectorMXBean)
- * - Heap allocation velocity (MB/s)
- *
- * Computes runtime StressLevel and informs sub-modules to scale background overhead.
+ * Key Architecture Guarantees:
+ * - 20,000-frame rolling ring buffer for statistically sound 1% Low (200 slowest) and 0.1% Low (20 slowest).
+ * - Zero Render Thread sorting overhead: percentile computation runs on an isolated priority-1 background daemon.
+ * - Anti-flapping hysteresis & dwell timer: requires sustained load shifts (3s escalate / 5s recover).
+ * - Bottleneck attribution: differentiates CPU tick starvation, Render/GPU bottlenecks, and GC pauses.
  */
 public final class AdaptivePerformanceEngine {
 
@@ -24,163 +19,273 @@ public final class AdaptivePerformanceEngine {
         return INSTANCE;
     }
 
-    // ── Frame Time Metrics (500 frames ring buffer) ───────────────
-    private static final int FRAME_BUFFER_SIZE = 512;
+    // ── Frame Time Ring Buffer (20,000 frames) ────────────────────
+    public static final int FRAME_BUFFER_SIZE = 20_000;
     private final long[] frameDurationsNano = new long[FRAME_BUFFER_SIZE];
+    private final Object frameLock = new Object();
     private int frameIndex = 0;
     private int frameCount = 0;
 
-    // ── Tick Metrics (100 ticks ring buffer) ───────────────────────
+    // ── Tick Metrics (128 ticks ring buffer) ──────────────────────
     private static final int TICK_BUFFER_SIZE = 128;
     private final long[] tickDurationsNano = new long[TICK_BUFFER_SIZE];
+    private final Object tickLock = new Object();
     private int tickIndex = 0;
     private int tickCount = 0;
+    private volatile boolean localServerActive = false;
 
-    // ── Telemetry Cache ───────────────────────────────────────────
+    // ── Live Telemetry Metrics ────────────────────────────────────
     private volatile double cachedAvgFps = 60.0;
+    private volatile double cachedAvgFrameTimeMs = 16.67;
     private volatile double cachedOnePercentLow = 60.0;
     private volatile double cachedPointOnePercentLow = 60.0;
-    private volatile double cachedMspt = 20.0;
+    private volatile double cachedMspt = 0.0;
     private volatile StressLevel currentStress = StressLevel.NORMAL;
+    private volatile BottleneckType bottleneckType = BottleneckType.BALANCED;
 
-    // ── Memory & GC Tracking ──────────────────────────────────────
-    private final List<GarbageCollectorMXBean> gcBeans = ManagementFactory.getGarbageCollectorMXBeans();
-    private long lastAllocCheckTime = System.currentTimeMillis();
-    private long lastUsedMemory = 0;
-    private volatile double allocationRateMbPerSec = 0.0;
-    private volatile long totalGcPauseMs = 0;
+    // ── Hysteresis & Dwell Timer State ────────────────────────────
+    private static final long ESCALATION_DWELL_MS = 3_000L;
+    private static final long RECOVERY_DWELL_MS = 5_000L;
+    private StressLevel candidateStress = StressLevel.NORMAL;
+    private long candidateSinceMs = System.currentTimeMillis();
 
-    private long lastStatsUpdate = 0;
+    // ── Background Telemetry Worker ───────────────────────────────
+    private volatile boolean workerRunning = false;
+    private Thread workerThread = null;
 
     private AdaptivePerformanceEngine() {
-        Arrays.fill(frameDurationsNano, 16_666_666L); // 60 FPS default
+        Arrays.fill(frameDurationsNano, 16_666_666L);
+    }
+
+    public synchronized void startBackgroundWorker() {
+        GcMonitor.register();
+        if (workerRunning) {
+            return;
+        }
+        workerRunning = true;
+        workerThread = new Thread(this::workerLoop, "S1ind-Telemetry-Worker");
+        workerThread.setDaemon(true);
+        workerThread.setPriority(Thread.MIN_PRIORITY);
+        workerThread.start();
+    }
+
+    public synchronized void stopBackgroundWorker() {
+        workerRunning = false;
+        if (workerThread != null) {
+            workerThread.interrupt();
+            workerThread = null;
+        }
     }
 
     /**
-     * Records a single client frame duration in nanoseconds.
+     * Records a client frame duration in nanoseconds in O(1) time.
+     * Performs zero allocations and zero sorting on the Render Thread.
      */
-    public synchronized void recordFrame(long durationNano) {
+    public void recordFrame(long durationNano) {
         if (durationNano <= 0) return;
-
-        frameDurationsNano[frameIndex] = durationNano;
-        frameIndex = (frameIndex + 1) % FRAME_BUFFER_SIZE;
-        if (frameCount < FRAME_BUFFER_SIZE) {
-            frameCount++;
-        }
-
-        long now = System.currentTimeMillis();
-        if (now - lastStatsUpdate >= 250) { // Refresh stats 4 times per second
-            recalculateMetrics(now);
-            lastStatsUpdate = now;
+        synchronized (frameLock) {
+            frameDurationsNano[frameIndex] = durationNano;
+            frameIndex = (frameIndex + 1) % FRAME_BUFFER_SIZE;
+            if (frameCount < FRAME_BUFFER_SIZE) {
+                frameCount++;
+            }
         }
     }
 
     /**
      * Records an integrated server tick duration in nanoseconds.
      */
-    public synchronized void recordTick(long durationNano) {
+    public void recordTick(long durationNano) {
         if (durationNano <= 0) return;
-
-        tickDurationsNano[tickIndex] = durationNano;
-        tickIndex = (tickIndex + 1) % TICK_BUFFER_SIZE;
-        if (tickCount < TICK_BUFFER_SIZE) {
-            tickCount++;
+        this.localServerActive = true;
+        synchronized (tickLock) {
+            tickDurationsNano[tickIndex] = durationNano;
+            tickIndex = (tickIndex + 1) % TICK_BUFFER_SIZE;
+            if (tickCount < TICK_BUFFER_SIZE) {
+                tickCount++;
+            }
         }
     }
 
-    private void recalculateMetrics(long nowMs) {
-        // 1. Frame percentiles
-        int count = frameCount;
-        if (count > 0) {
-            long[] copy = new long[count];
-            System.arraycopy(frameDurationsNano, 0, copy, 0, count);
-            Arrays.sort(copy);
+    public void setLocalServerActive(boolean active) {
+        this.localServerActive = active;
+    }
+
+    public boolean isLocalServerActive() {
+        return localServerActive;
+    }
+
+    private void workerLoop() {
+        while (workerRunning) {
+            try {
+                Thread.sleep(1000L);
+                recalculateNow(System.currentTimeMillis());
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    /**
+     * Package-private / public synchronous trigger for unit testing and background loop.
+     */
+    public void recalculateNow(long nowMs) {
+        // 1. Copy frame buffer outside Render Thread lock
+        long[] sample;
+        int count;
+        synchronized (frameLock) {
+            count = frameCount;
+            if (count > 0) {
+                sample = new long[count];
+                System.arraycopy(frameDurationsNano, 0, sample, 0, count);
+            } else {
+                sample = null;
+            }
+        }
+
+        if (sample != null && count > 0) {
+            Arrays.sort(sample);
 
             long totalNano = 0;
-            for (long d : copy) totalNano += d;
-            double meanFrameNano = (double) totalNano / count;
-            this.cachedAvgFps = meanFrameNano > 0 ? (1_000_000_000.0 / meanFrameNano) : 0.0;
+            for (long d : sample) {
+                totalNano += d;
+            }
+            double meanNano = (double) totalNano / count;
+            this.cachedAvgFrameTimeMs = meanNano / 1_000_000.0;
+            this.cachedAvgFps = meanNano > 0 ? (1_000_000_000.0 / meanNano) : 0.0;
 
-            // 1% Low = 99th percentile slowest frame
-            int idx99 = Math.min(count - 1, (int) Math.round(count * 0.99));
-            long p99Nano = copy[idx99];
+            // 1% Low (99th percentile slowest frame -> average of slowest 1% or p99 cutoff)
+            int idx99 = Math.min(count - 1, (int) Math.floor(count * 0.99));
+            double p99Nano = sample[idx99];
             this.cachedOnePercentLow = p99Nano > 0 ? (1_000_000_000.0 / p99Nano) : 0.0;
 
-            // 0.1% Low = 99.9th percentile slowest frame
-            int idx999 = Math.min(count - 1, (int) Math.round(count * 0.999));
-            long p999Nano = copy[idx999];
+            // 0.1% Low (99.9th percentile slowest frame)
+            int idx999 = Math.min(count - 1, (int) Math.floor(count * 0.999));
+            double p999Nano = sample[idx999];
             this.cachedPointOnePercentLow = p999Nano > 0 ? (1_000_000_000.0 / p999Nano) : 0.0;
         }
 
-        // 2. MSPT
-        int tCount = tickCount;
-        if (tCount > 0) {
+        // 2. Compute MSPT if running local server
+        if (localServerActive) {
             long totalTickNano = 0;
-            for (int i = 0; i < tCount; i++) {
-                totalTickNano += tickDurationsNano[i];
+            int tCount;
+            synchronized (tickLock) {
+                tCount = tickCount;
+                for (int i = 0; i < tCount; i++) {
+                    totalTickNano += tickDurationsNano[i];
+                }
             }
-            this.cachedMspt = (double) totalTickNano / (tCount * 1_000_000.0);
-        }
-
-        // 3. GC Duration
-        long gcTime = 0;
-        for (GarbageCollectorMXBean bean : gcBeans) {
-            long t = bean.getCollectionTime();
-            if (t > 0) gcTime += t;
-        }
-        this.totalGcPauseMs = gcTime;
-
-        // 4. Allocation Rate (MB/sec)
-        long elapsedAllocMs = nowMs - lastAllocCheckTime;
-        if (elapsedAllocMs >= 1000) {
-            Runtime rt = Runtime.getRuntime();
-            long currentUsed = rt.totalMemory() - rt.freeMemory();
-            if (currentUsed > lastUsedMemory && lastUsedMemory > 0) {
-                double allocatedBytes = currentUsed - lastUsedMemory;
-                this.allocationRateMbPerSec = (allocatedBytes / (1024.0 * 1024.0)) / (elapsedAllocMs / 1000.0);
+            if (tCount > 0) {
+                this.cachedMspt = (double) totalTickNano / (tCount * 1_000_000.0);
             }
-            this.lastUsedMemory = currentUsed;
-            this.lastAllocCheckTime = nowMs;
-        }
-
-        // 5. Compute Stress Level
-        // If FPS < 35 or MSPT > 45ms -> CRITICAL
-        // If FPS < 50 or MSPT > 35ms -> MODERATE
-        // Else -> NORMAL
-        if (this.cachedAvgFps < 35.0 || this.cachedOnePercentLow < 25.0 || this.cachedMspt > 45.0) {
-            this.currentStress = StressLevel.CRITICAL;
-        } else if (this.cachedAvgFps < 52.0 || this.cachedOnePercentLow < 40.0 || this.cachedMspt > 35.0) {
-            this.currentStress = StressLevel.MODERATE;
         } else {
-            this.currentStress = StressLevel.NORMAL;
+            this.cachedMspt = 0.0;
+        }
+
+        // 3. Evaluate raw target stress with hysteresis bands
+        StressLevel rawTarget = evaluateRawStress(this.currentStress);
+        updateStressWithHysteresis(rawTarget, nowMs);
+
+        // 4. Identify Bottleneck
+        this.bottleneckType = evaluateBottleneck();
+    }
+
+    private StressLevel evaluateRawStress(StressLevel current) {
+        double fps = this.cachedAvgFps;
+        double low1 = this.cachedOnePercentLow;
+        double mspt = this.localServerActive ? this.cachedMspt : 0.0;
+
+        // Hysteresis thresholds: require deeper recovery than entry threshold
+        return switch (current) {
+            case NORMAL -> {
+                if (fps < 32.0 || low1 < 22.0 || mspt > 46.0) yield StressLevel.CRITICAL;
+                if (fps < 48.0 || low1 < 35.0 || mspt > 36.0) yield StressLevel.MODERATE;
+                yield StressLevel.NORMAL;
+            }
+            case MODERATE -> {
+                if (fps < 32.0 || low1 < 22.0 || mspt > 46.0) yield StressLevel.CRITICAL;
+                if (fps >= 55.0 && low1 >= 42.0 && mspt <= 30.0) yield StressLevel.NORMAL;
+                yield StressLevel.MODERATE;
+            }
+            case CRITICAL -> {
+                if (fps >= 42.0 && low1 >= 30.0 && mspt <= 40.0) yield StressLevel.MODERATE;
+                yield StressLevel.CRITICAL;
+            }
+        };
+    }
+
+    private void updateStressWithHysteresis(StressLevel rawTarget, long nowMs) {
+        if (rawTarget == this.currentStress) {
+            this.candidateStress = this.currentStress;
+            this.candidateSinceMs = nowMs;
+            return;
+        }
+
+        if (rawTarget != this.candidateStress) {
+            this.candidateStress = rawTarget;
+            this.candidateSinceMs = nowMs;
+            return;
+        }
+
+        boolean isEscalating = rawTarget.ordinal() > this.currentStress.ordinal();
+        long requiredDwell = isEscalating ? ESCALATION_DWELL_MS : RECOVERY_DWELL_MS;
+
+        if (nowMs - this.candidateSinceMs >= requiredDwell) {
+            this.currentStress = rawTarget;
+            this.candidateSinceMs = nowMs;
         }
     }
 
-    public double getAvgFps() {
-        return cachedAvgFps;
+    private BottleneckType evaluateBottleneck() {
+        if (GcMonitor.isRecentlyGcStalled()) {
+            return BottleneckType.GC_BOUND;
+        }
+        if (localServerActive && cachedMspt > 38.0) {
+            return BottleneckType.CPU_TICK_BOUND;
+        }
+        if (cachedAvgFrameTimeMs > 22.0 && (!localServerActive || cachedMspt < 28.0)) {
+            return BottleneckType.RENDER_GPU_BOUND;
+        }
+        return BottleneckType.BALANCED;
     }
 
-    public double getOnePercentLow() {
-        return cachedOnePercentLow;
+    /** Used in unit tests to reset internal buffers cleanly. */
+    public void resetForTesting() {
+        synchronized (frameLock) {
+            frameIndex = 0;
+            frameCount = 0;
+            Arrays.fill(frameDurationsNano, 16_666_666L);
+        }
+        synchronized (tickLock) {
+            tickIndex = 0;
+            tickCount = 0;
+            Arrays.fill(tickDurationsNano, 0L);
+        }
+        localServerActive = false;
+        currentStress = StressLevel.NORMAL;
+        candidateStress = StressLevel.NORMAL;
+        candidateSinceMs = System.currentTimeMillis();
+        cachedAvgFps = 60.0;
+        cachedAvgFrameTimeMs = 16.67;
+        cachedOnePercentLow = 60.0;
+        cachedPointOnePercentLow = 60.0;
+        cachedMspt = 0.0;
+        bottleneckType = BottleneckType.BALANCED;
     }
 
-    public double getPointOnePercentLow() {
-        return cachedPointOnePercentLow;
+    public int getSampledFrameCount() {
+        synchronized (frameLock) {
+            return frameCount;
+        }
     }
 
-    public double getMspt() {
-        return cachedMspt;
-    }
-
-    public double getAllocationRateMbPerSec() {
-        return allocationRateMbPerSec;
-    }
-
-    public long getTotalGcPauseMs() {
-        return totalGcPauseMs;
-    }
-
-    public StressLevel getStressLevel() {
-        return currentStress;
-    }
+    public double getAvgFps()                  { return cachedAvgFps; }
+    public double getAvgFrameTimeMs()          { return cachedAvgFrameTimeMs; }
+    public double getOnePercentLow()           { return cachedOnePercentLow; }
+    public double getPointOnePercentLow()      { return cachedPointOnePercentLow; }
+    public double getMspt()                    { return cachedMspt; }
+    public StressLevel getStressLevel()        { return currentStress; }
+    public BottleneckType getBottleneckType()  { return bottleneckType; }
 }

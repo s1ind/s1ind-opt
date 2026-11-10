@@ -19,7 +19,7 @@ public class S1indOptMod implements ModInitializer {
     public void onInitialize() {
         config = S1indConfig.load();
 
-        LOG.info("[S1ind] Initializing S1ind Optimizer v3.0.0 (Adaptive Performance Engine)");
+        LOG.info("[S1ind] Initializing S1ind Optimizer v3.1.0 (Adaptive Performance Engine)");
         LOG.info("[S1ind] Active Profile: {}", config.profile());
         LOG.info("[S1ind] Adaptive Performance Engine: {}", config.enableAdaptiveEngine() ? "ACTIVE" : "DISABLED");
         LOG.info("[S1ind] In-game F3 Telemetry (1% / 0.1% Low): {}", config.enableF3Telemetry() ? "ENABLED" : "DISABLED");

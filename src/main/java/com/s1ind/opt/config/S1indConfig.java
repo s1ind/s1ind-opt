@@ -10,7 +10,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 
 /**
- * Configuration for S1ind Optimizer v3.0.0.
+ * Configuration for S1ind Optimizer v3.1.0.
  * Persists as JSON in config/s1ind_opt.json.
  */
 public class S1indConfig {
@@ -21,14 +21,14 @@ public class S1indConfig {
     private PerformanceProfile profile = PerformanceProfile.BALANCED;
 
     // ── Adaptive Performance Engine (APE) ─────────────────────────
-    /** Dynamically monitors frame jitter, 1% Low FPS, and scales background tasks. */
+    /** Dynamically monitors frame jitter, 1% / 0.1% Low FPS, and scales throttling. */
     private boolean enableAdaptiveEngine = true;
 
-    /** Shows real-time 1% Low, 0.1% Low, and MSPT on the F3 debug screen. */
+    /** Shows real-time metrics (1% Low, 0.1% Low, MSPT, GC) on F3 debug screen. */
     private boolean enableF3Telemetry = true;
 
-    // ── Thread & Rendering Settings ──────────────────────────────
-    /** Elevates the Render Thread priority to Thread.MAX_PRIORITY (10). */
+    // ── Thread & Scheduling Settings ─────────────────────────────
+    /** Requests OS scheduler bias for Render Thread via Thread.MAX_PRIORITY (10). */
     private boolean boostRenderThreadPriority = true;
 
     /** Lowers background worker threads (ForkJoin & IO) to Thread.NORM_PRIORITY - 1 (4). */
@@ -37,9 +37,15 @@ public class S1indConfig {
     /** Background worker thread limit (0 = auto-calculate). */
     private int backgroundThreadCount = 0;
 
-    // ── Entity Settings ──────────────────────────────────────────
-    /** Throttles AI pathfinding updates strictly for PASSIVE mobs outside player radius. */
+    // ── Safe AI Scheduler Settings ───────────────────────────────
+    /** Heuristic throttling for distant passive mobs beyond player radius. */
     private boolean throttleDistantPassiveMobAi = true;
+
+    /** Protects villagers and wandering traders from AI throttling (preserves iron farms/trades). */
+    private boolean protectVillagerAi = true;
+
+    /** Protects third-party modded entities from AI throttling. */
+    private boolean protectModdedEntities = true;
 
     /** Distance in blocks beyond which passive mobs receive tiered throttling. */
     private double passiveMobDistanceThreshold = 32.0;
@@ -66,6 +72,8 @@ public class S1indConfig {
     public boolean boostRenderThreadPriority()          { return profile != PerformanceProfile.COMPATIBILITY && boostRenderThreadPriority; }
     public boolean lowerBackgroundThreadPriority()      { return profile != PerformanceProfile.COMPATIBILITY && lowerBackgroundThreadPriority; }
     public boolean throttleDistantPassiveMobAi()         { return profile != PerformanceProfile.COMPATIBILITY && throttleDistantPassiveMobAi; }
+    public boolean protectVillagerAi()                  { return protectVillagerAi; }
+    public boolean protectModdedEntities()              { return protectModdedEntities; }
     public double  passiveMobDistanceThreshold()         { return Math.max(16.0, Math.min(128.0, passiveMobDistanceThreshold)); }
     public boolean fastLightUpdates()                   { return profile != PerformanceProfile.COMPATIBILITY && fastLightUpdates; }
     public boolean autoMemoryClean()                    { return autoMemoryClean; }
@@ -73,10 +81,10 @@ public class S1indConfig {
     public int     memoryPressureThresholdPercent()     { return Math.min(95, Math.max(70, memoryPressureThresholdPercent)); }
 
     /**
-     * Intelligently budgets background worker threads based on available CPU cores:
-     * - Dual-core (<=2 cores): 1 worker (leaves 1 dedicated core for Game / Render)
-     * - Quad-core (3-4 cores): cores - 1 (leaves 1 core free)
-     * - Multi-core (5+ cores): cores - 2, capped at 8 (leaves 2 cores for Game loop + Render)
+     * Budgets background worker threads based on available logical cores:
+     * - Dual-core (<=2 cores): 1 worker
+     * - Quad-core (3-4 cores): cores - 1
+     * - Multi-core (5+ cores): cores - 2, capped at 8
      */
     public int backgroundThreadCount() {
         int availableCores = Runtime.getRuntime().availableProcessors();

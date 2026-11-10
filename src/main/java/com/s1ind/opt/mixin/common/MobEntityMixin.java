@@ -1,13 +1,17 @@
 package com.s1ind.opt.mixin.common;
 
 import com.s1ind.opt.S1indOptMod;
+import com.s1ind.opt.config.S1indConfig;
 import com.s1ind.opt.engine.AdaptivePerformanceEngine;
 import com.s1ind.opt.engine.StressLevel;
 import net.minecraft.entity.EntityType;
 import net.minecraft.entity.LivingEntity;
 import net.minecraft.entity.mob.MobEntity;
 import net.minecraft.entity.passive.AnimalEntity;
+import net.minecraft.entity.passive.MerchantEntity;
 import net.minecraft.entity.passive.PassiveEntity;
+import net.minecraft.entity.passive.TameableEntity;
+import net.minecraft.util.Identifier;
 import net.minecraft.world.World;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
@@ -17,20 +21,18 @@ import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 /**
- * Adaptive AI throttling strictly for PASSIVE entities (animals, villagers, ambient).
+ * Heuristic-guarded AI throttling strictly for vanilla passive entities.
  *
- * Guaranteed Safety Guards:
- * - Hostile mobs (Zombies, Creepers, Skeletons, etc.) are NEVER throttled.
- * - Named mobs (custom names / name tags) are NEVER throttled.
- * - Leashed or ridden mobs are NEVER throttled.
- * - Breeding animals (isInLove) are NEVER throttled.
- * - Damaged or combat-active mobs are NEVER throttled.
- * - Near player (< 16 blocks): 0% throttling (100% full vanilla tick rate).
- *
- * Outside 16/32 blocks, throttling scales adaptively based on APE StressLevel:
- * - NORMAL: 50% skip >32 blocks.
- * - MODERATE: 66% skip >32 blocks.
- * - CRITICAL: 75% skip >32 blocks, 50% skip 16-32 blocks.
+ * Explicit Exclusions (Never throttled):
+ * - All hostile mobs (Zombies, Creepers, Skeletons, etc.)
+ * - Third-party modded entities (if protectModdedEntities=true)
+ * - Villagers & Wandering Traders (MerchantEntity, if protectVillagerAi=true)
+ * - Tamed pets (TameableEntity.isTamed)
+ * - Custom named mobs (hasCustomName)
+ * - Leashed or mounted/riding mobs
+ * - Breeding animals (isInLove)
+ * - Mobs panicking or actively targeted in combat
+ * - Entities within 16 blocks of a player
  */
 @Mixin(MobEntity.class)
 public abstract class MobEntityMixin extends LivingEntity {
@@ -48,39 +50,51 @@ public abstract class MobEntityMixin extends LivingEntity {
     @Unique
     private double s1ind$cachedPlayerDistance = 0.0;
 
+    @Unique
+    private Boolean s1ind$isEligibleVanillaPassive = null;
+
     @Inject(method = "tickNewAi", at = @At("HEAD"), cancellable = true)
-    private void s1ind$throttlePassiveAiAdaptively(CallbackInfo ci) {
-        if (S1indOptMod.config() == null || !S1indOptMod.config().throttleDistantPassiveMobAi()) {
+    private void s1ind$throttlePassiveAiSafely(CallbackInfo ci) {
+        S1indConfig cfg = S1indOptMod.config();
+        if (cfg == null || !cfg.throttleDistantPassiveMobAi()) {
             return;
         }
 
-        // GUARD 1: Only apply to passive entities
-        if (!((Object) this instanceof PassiveEntity)) {
+        // One-time eligibility check per entity lifetime (zero repeat allocations)
+        if (s1ind$isEligibleVanillaPassive == null) {
+            if (!((Object) this instanceof PassiveEntity)) {
+                s1ind$isEligibleVanillaPassive = false;
+                return;
+            }
+            if (cfg.protectVillagerAi() && (Object) this instanceof MerchantEntity) {
+                s1ind$isEligibleVanillaPassive = false;
+                return;
+            }
+            if (cfg.protectModdedEntities()) {
+                Identifier id = EntityType.getId(this.getType());
+                if (id == null || !"minecraft".equals(id.getNamespace())) {
+                    s1ind$isEligibleVanillaPassive = false;
+                    return;
+                }
+            }
+            s1ind$isEligibleVanillaPassive = true;
+        }
+
+        if (!s1ind$isEligibleVanillaPassive) {
             return;
         }
 
-        // GUARD 2: Preserve named pets/mobs
-        if (this.hasCustomName()) {
-            return;
-        }
+        // Dynamic gameplay safety guards
+        if (this.hasCustomName()) return;
 
-        // GUARD 3: Preserve leashed or ridden entities
         MobEntity self = (MobEntity) (Object) this;
-        if (self.isLeashed() || this.hasPassengers() || this.hasVehicle()) {
-            return;
-        }
+        if (self.isLeashed() || this.hasPassengers() || this.hasVehicle()) return;
 
-        // GUARD 4: Preserve breeding animals
-        if ((Object) this instanceof AnimalEntity animal && animal.isInLove()) {
-            return;
-        }
+        if ((Object) this instanceof TameableEntity tameable && tameable.isTamed()) return;
+        if ((Object) this instanceof AnimalEntity animal && animal.isInLove()) return;
+        if (this.getTarget() != null || this.getAttacker() != null) return;
 
-        // GUARD 5: Preserve mobs actively panicking or in combat
-        if (this.getTarget() != null || this.getAttacker() != null) {
-            return;
-        }
-
-        // Update player distance once every 32 ticks (spread by entity ID)
+        // Refresh player distance every 32 ticks (spread by entity ID)
         if (((this.age + this.getId()) & 31) == 0) {
             World world = this.getEntityWorld();
             if (world != null) {
@@ -89,42 +103,41 @@ public abstract class MobEntityMixin extends LivingEntity {
             }
         }
 
-        // Close to player (< 16 blocks): 100% full fidelity
+        // Interaction zone (< 16 blocks): 100% vanilla fidelity
         if (s1ind$cachedPlayerDistance < 16.0) {
             return;
         }
 
-        double threshold = S1indOptMod.config().passiveMobDistanceThreshold();
-        StressLevel stress = AdaptivePerformanceEngine.getInstance().getStressLevel();
+        double threshold = cfg.passiveMobDistanceThreshold();
+        StressLevel stress = cfg.enableAdaptiveEngine()
+            ? AdaptivePerformanceEngine.getInstance().getStressLevel()
+            : StressLevel.NORMAL;
 
         s1ind$skipCounter++;
 
-        // Intermediate zone: 16 to 32 blocks
+        // Intermediate zone: 16 to threshold blocks
         if (s1ind$cachedPlayerDistance < threshold) {
             if (stress == StressLevel.CRITICAL && (s1ind$skipCounter & 1) != 0) {
-                ci.cancel(); // 50% skip under critical load only
+                ci.cancel();
             }
             return;
         }
 
-        // Distant zone: > threshold blocks (32+)
+        // Distant zone: > threshold blocks (default 32+)
         switch (stress) {
             case CRITICAL -> {
-                // Skip 3 of 4 ticks (75% reduction under emergency load)
                 if ((s1ind$skipCounter & 3) != 0) {
-                    ci.cancel();
+                    ci.cancel(); // Skip 3 of 4
                 }
             }
             case MODERATE -> {
-                // Skip 2 of 3 ticks (66% reduction under moderate load)
                 if ((s1ind$skipCounter % 3) != 0) {
-                    ci.cancel();
+                    ci.cancel(); // Skip 2 of 3
                 }
             }
             default -> {
-                // Skip 1 of 2 ticks (50% reduction under normal load)
                 if ((s1ind$skipCounter & 1) != 0) {
-                    ci.cancel();
+                    ci.cancel(); // Skip 1 of 2
                 }
             }
         }

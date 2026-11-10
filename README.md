@@ -1,108 +1,74 @@
-# S1ind Optimizer v3.0.0 (Adaptive Performance Engine)
+# S1ind Optimizer v3.1.0 (Adaptive Performance Engine)
 
 [![Release](https://img.shields.io/github/v/release/s1ind/s1ind-opt?style=flat-square)](https://github.com/s1ind/s1ind-opt/releases)
 [![Minecraft](https://img.shields.io/badge/Minecraft-1.21.11-blue?style=flat-square)](https://fabricmc.net/)
 [![Fabric Loader](https://img.shields.io/badge/Fabric-0.19.5-green?style=flat-square)](https://fabricmc.net/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE)
 
-**S1ind Optimizer v3.0.0** — модульный оптимизатор Minecraft Java 1.21.11, построенный на архитектуре **Adaptive Performance Engine (APE)**.
-
-Вместо слепого вмешательства в графический конвейер (где отлично работают Sodium и Iris), мод динамически отслеживает устойчивость фреймтайма и распределяет вычислительные ресурсы между потоком рендера, логическим тиком и фоновыми воркерами.
+**S1ind Optimizer v3.1.0** — инженерно выверенный оптимизатор для **Minecraft Java 1.21.11 (Fabric)** с событийным мониторингом JVM, математически обоснованной телеметрией фреймтайма и гистерезисным управлением нагрузкой.
 
 ---
 
-## 🚀 Архитектура APE v3.0 (Adaptive Performance Engine)
+## 🛠️ Что изменено и проверено в v3.1.0
 
-### 1. In-Engine телеметрия (F3 Debug HUD)
-- Кольцевой буфер на 512 кадров с наносекундной точностью непрерывно рассчитывает:
-  - **Avg FPS** (средняя частота кадров).
-  - **1% Low FPS** (99-й перцентиль задержки — устойчивость динамических сцен).
-  - **0.1% Low FPS** (99.9-й перцентиль — редкие микростаттеры и фризы).
-  - **MSPT** (длительность серверного тика).
-  - **GC Pause Time** (время остановок Stop-The-World через `GarbageCollectorMXBean`).
-- Отображается прямо на экране F3:
-  ```
-  [S1ind APE v3.0] FPS: 144 | 1% Low: 112 | 0.1% Low: 86 | MSPT: 14.2ms | GC: 12ms | Stress: NORMAL
-  ```
+### 1. Кольцевой буфер на 20 000 кадров с фоновым расчётом (`AdaptivePerformanceEngine`)
+- **Исправлен недостаток 512 кадров:** размер выборки увеличен до **20 000 кадров**.
+  - `1% Low` строится по 200 медленнейшим кадрам (p99).
+  - `0.1% Low` строится по 20 медленнейшим кадрам (p99.9).
+- **Нулевая нагрузка на рендер (`O(1)`):** поток рендера только записывает наносекундную дельту в циклический массив. Тяжёлая сортировка `Arrays.sort()` вынесена в изолированный фоновый демон `S1ind-Telemetry-Worker` с приоритетом `MIN_PRIORITY`.
 
-### 2. Динамическое регулирование нагрузки (Stress Levels)
-Движок непрерывно вычисляет текущий стресс системы:
-- `NORMAL` (FPS >= 52, MSPT <= 35ms): полная точность вычислений, стандартное фоновое расписание.
-- `MODERATE` (FPS 35–52, MSPT 35–45ms): умеренное сжатие очередей AI и сброс некритичных вычислений.
-- `CRITICAL` (FPS < 35, MSPT > 45ms): максимальный сброс AI дальних мобов и приоритет игровому циклу.
+### 2. Анти-флаппинг гистерезис и определение узких мест (Bottleneck Attribution)
+- Введены задержки переключения состояний (**Dwell Timers**):
+  - Эскалация нагрузки (`NORMAL -> MODERATE -> CRITICAL`) происходит, только если просадка держится непрерывно **>= 3.0 секунд**.
+  - Сброс обратно к `NORMAL` требует стабильного запаса производительности в течение **>= 5.0 секунд** с более высоким порогом восстановления.
+- Различение причины тормозов (`BottleneckType`):
+  - `CPU_TICK_BOUND`: серверный тик >38ms, при этом кадр рисуется быстро.
+  - `RENDER_GPU_BOUND`: кадр >22ms (<45 FPS), при нормальном тике логики.
+  - `GC_BOUND`: событийная детекция недавней паузы GC >=50ms.
 
-### 3. Трёхуровневый троттлинг пассивных мобов (`MobEntityMixin`)
-В отличие от наивных модов, выключающих тики целиком:
-- **Зона взаимодействия (<16 блоков):** 100% честный ванильный тик (торговля, кормление, реакция на игрока).
-- **Средняя зона (16–32 блока):** 100% при норме; 50% сброс только при критической просадке FPS.
-- **Дальняя зона (>32 блоков):** адаптивный пропуск от 50% до 75% вызовов `tickNewAi`.
-- **Гарантии безопасности:**
-  - Враждебные мобы **никогда не замедляются**.
-  - Именные животные (`hasCustomName`) сохраняют 100% тиков.
-  - Животные на поводке (`isLeashed`), в лодках/вагонетках или под седлом **никогда не замедляются**.
-  - Спаривающиеся животные (`isInLove`) и мобы в панике/бою не трогаются.
+### 3. Событийный мониторинг GC (`GcMonitor`)
+- Отказ от усреднённого счётчика `getCollectionTime()`.
+- Используется `NotificationEmitter` + `GarbageCollectionNotificationInfo`: подписка на реальные события завершения циклов сборки мусора с точным временем конкретной паузы и её причиной (`lastPauseMs`, `maxRecentPauseMs`).
 
-### 4. Честный баланс потоков планировщика
-- Потоку рендера назначается `Thread.MAX_PRIORITY` (10), давая преимущество в квантах времени планировщика ОС.
-- Фоновым работникам (`ForkJoinWorkerThread` и `IO-Worker`) фабрично выставляется `Thread.NORM_PRIORITY - 1` (4).
-- Для 2-ядерных CPU выделяется ровно 1 фоновый поток, предотвращая голодание видеокарты.
+### 4. Честный MSPT для одиночной игры и серверов (`MinecraftServerMixin` + `PerformanceTelemetry`)
+- В одиночной игре замеряется реальная длительность `MinecraftServer.tick()`.
+- На удалённых серверах (`!isIntegratedServerRunning()`) в F3 явно пишется `MSPT: Remote`, без фиктивных вычислений на стороне клиента.
 
-### 5. Безопасность памяти
-- Навязчивый спам `System.gc()` каждые 15 секунд полностью устранён.
-- Опциональный сторож памяти активируется только при одновременном выполнении условий: куча >88% и свободного остатка менее 250 МБ.
+### 5. Безопасный планировщик AI мобов (Heuristic-Guarded)
+Вместо заявлений о «100% безопасности» реализована чёткая система исключений:
+- Враждебные мобы (`!PassiveEntity`) — **не трогаются**.
+- Жители и торговцы (`MerchantEntity`) — защищены по умолчанию (`protectVillagerAi = true`), чтобы не нарушать торговые залы и фермы железа.
+- Сущности из сторонних модов (`!namespace.equals("minecraft")`) — защищены по умолчанию (`protectModdedEntities = true`).
+- Приручённые (`isTamed`), именные (`hasCustomName`), привязанные поводком (`isLeashed`), оседланные и спаривающиеся животные (`isInLove`) — **всегда 100% ванильный тик**.
+- Ближний радиус (`< 16` блоков) — **всегда 100% ванильный тик**.
 
 ---
 
-## ⚙️ Профили оптимизации (`config/s1ind_opt.json`)
+## 📊 Сводная телеметрия на экране F3
 
-В v3.0.0 доступны три готовых пресета:
-- `"profile": "BALANCED"` (Рекомендуемый): умная адаптивная оптимизация с полным сохранением ванильной механики.
-- `"profile": "PERFORMANCE"`: агрессивный троттлинг дальних мобов для слабых процессоров.
-- `"profile": "COMPATIBILITY"`: минимальное вмешательство, отключение всех хуков кроме телеметрии.
-
-```json
-{
-  "profile": "BALANCED",
-  "enableAdaptiveEngine": true,
-  "enableF3Telemetry": true,
-  "boostRenderThreadPriority": true,
-  "lowerBackgroundThreadPriority": true,
-  "backgroundThreadCount": 0,
-  "throttleDistantPassiveMobAi": true,
-  "passiveMobDistanceThreshold": 32.0,
-  "fastLightUpdates": true,
-  "autoMemoryClean": false,
-  "memoryCheckIntervalSeconds": 30,
-  "memoryPressureThresholdPercent": 88
-}
+```text
+[S1ind APE v3.1] FPS: 144 (6.9ms) | 1% Low: 118 | 0.1% Low: 92 (n=20000)
+[S1ind Metrics] MSPT: 11.4ms | GC Pause: 4ms (Max: 12ms) | Stress: NORMAL [BALANCED]
 ```
 
 ---
 
-## 🤝 Совместимость
+## 🧪 Автоматическое тестирование (JUnit 5)
 
-Мод полностью совместим со следующим стеком:
-- **Sodium / Embeddium**
-- **Iris Shaders / Oculus**
-- **ImmediatelyFast**
-- **Lithium**
-- **Entity Culling**
-- **FerriteCore / ModernFix**
+Алгоритмы статистики перцентилей, гистерезиса переходов и детекции узких мест покрыты юнит-тестами (`./gradlew test`):
+- `test20kFrameRingBufferPercentiles()` — верификация 1% и 0.1% Low по 20 000 кадров.
+- `testAntiFlappingHysteresisAndDwell()` — проверка защиты от дребезга состояний на кратковременном скачке лага.
+- `testBottleneckAttributionCpuVsRender()` — проверка разделения `CPU_TICK_BOUND` и `RENDER_GPU_BOUND`.
 
 ---
 
-## 🔨 Сборка
+## 📦 Сборка и установка
+
+- **Требования:** Minecraft 1.21.11, Fabric Loader >=0.19.0, Java 21+.
+- **Совместимость:** Архитектурно спроектирован для совместной работы с Sodium, Iris, ImmediatelyFast, Lithium, Entity Culling и FerriteCore (требует комплексного игрового профилирования на конкретных сборках модов).
 
 ```bash
 git clone https://github.com/s1ind/s1ind-opt.git
 cd s1ind-opt
-./gradlew build
+./gradlew test build
 ```
-
-Готовые файлы находятся в каталоге `build/libs/`.
-
----
-
-## 📄 Лицензия
-
-MIT License (c) 2026 s1ind

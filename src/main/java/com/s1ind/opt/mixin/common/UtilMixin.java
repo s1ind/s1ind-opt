@@ -14,9 +14,9 @@ import java.util.concurrent.atomic.AtomicInteger;
 /**
  * Worker thread tuning and thread priority balancing.
  *
- * 1. Overrides Util.getAvailableBackgroundThreads() to allocate a balanced core count.
- * 2. Assigns Thread.NORM_PRIORITY - 1 (4) to IO and background worker threads
- *    to prevent them from preempting the Render Thread (Priority 10).
+ * 1. Overrides Util.getAvailableBackgroundThreads() with CPU-aware allocation.
+ * 2. Assigns Thread.NORM_PRIORITY - 1 (4) to IO and ForkJoin workers if enabled,
+ *    reducing OS scheduling contention against the Render Thread.
  */
 @Mixin(Util.class)
 public abstract class UtilMixin {
@@ -36,7 +36,7 @@ public abstract class UtilMixin {
     }
 
     /**
-     * Minecraft IO / Download thread creation factory.
+     * Minecraft IO / Download thread factory.
      */
     @Inject(
         method = "method_27956",
@@ -50,13 +50,13 @@ public abstract class UtilMixin {
         CallbackInfoReturnable<Thread> cir
     ) {
         Thread thread = cir.getReturnValue();
-        if (thread != null) {
-            thread.setPriority(Thread.NORM_PRIORITY - 1); // 4
+        if (thread != null && (S1indOptMod.config() == null || S1indOptMod.config().lowerBackgroundThreadPriority())) {
+            thread.setPriority(Thread.NORM_PRIORITY - 1);
         }
     }
 
     /**
-     * Minecraft ForkJoinWorkerThread creation factory.
+     * Minecraft ForkJoinWorkerThread factory.
      */
     @Inject(
         method = "method_28123",
@@ -69,8 +69,8 @@ public abstract class UtilMixin {
         CallbackInfoReturnable<ForkJoinWorkerThread> cir
     ) {
         ForkJoinWorkerThread thread = cir.getReturnValue();
-        if (thread != null) {
-            thread.setPriority(Thread.NORM_PRIORITY - 1); // 4
+        if (thread != null && (S1indOptMod.config() == null || S1indOptMod.config().lowerBackgroundThreadPriority())) {
+            thread.setPriority(Thread.NORM_PRIORITY - 1);
         }
     }
 }
